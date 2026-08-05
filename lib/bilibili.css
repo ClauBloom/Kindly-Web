@@ -1,0 +1,66 @@
+/* 注入 B 站页面的样式：尽量收敛、带 kw- 前缀避免与页面样式冲突 */
+
+.kw-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #9a4f3d;
+  background: #fdf0ea;
+  border: 1px solid #f0d2c4;
+  border-radius: 999px;
+  cursor: help;
+  vertical-align: middle;
+  font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+}
+
+.kw-bubble {
+  position: fixed;
+  z-index: 2147483647;
+  display: none;
+  max-width: 380px;
+  padding: 10px 14px;
+  background: #ffffff;
+  border: 1px solid #dfe4dc;
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(40, 54, 42, 0.16);
+  font-size: 13px;
+  line-height: 1.7;
+  color: #333c34;
+  pointer-events: none;
+  font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+}
+
+/* 错误浮层模式：可交互 */
+.kw-bubble-interactive {
+  pointer-events: auto;
+}
+
+.kw-bubble-retry {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 14px;
+  border: 1px solid #c8dcc9;
+  border-radius: 999px;
+  background: #e4ede4;
+  color: #3d6549;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.kw-bubble-retry:hover {
+  background: #d3e4d4;
+}
+
+.kw-bubble-label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: #5c7a62;
+}

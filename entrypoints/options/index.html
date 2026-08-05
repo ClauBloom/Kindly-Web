@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kindly Web · 设置</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="page-header">
+        <div class="title-row">
+          <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+            <path
+              d="M12 8h24a6 6 0 0 1 6 6v16a6 6 0 0 1-6 6H26l-8 6v-6h-6a6 6 0 0 1-6-6V14a6 6 0 0 1 6-6z"
+              fill="currentColor"
+            />
+            <path d="M17 27q7 5 14 0" stroke="#f4f6f3" stroke-width="2.6" fill="none" stroke-linecap="round" />
+          </svg>
+          <div>
+            <h1 class="wordmark">Kindly Web</h1>
+            <p class="subtitle"></p>
+          </div>
+        </div>
+        <button id="btn-save" class="btn btn-primary"></button>
+      </header>
+
+      <p id="save-toast" class="toast hidden" role="status"></p>
+
+      <section class="card">
+        <h2 class="section-title" id="sec-api"></h2>
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="provider" class="field-label"></label>
+            <select id="provider"></select>
+          </div>
+          <div class="form-field">
+            <label for="baseURL" class="field-label"></label>
+            <input id="baseURL" type="url" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-field">
+            <label for="modelName" class="field-label"></label>
+            <input id="modelName" type="text" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-field">
+            <label for="apiKey" class="field-label"></label>
+            <div class="key-row">
+              <input id="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-…（多个 Key 用逗号分隔）" />
+              <button id="key-eye" type="button" class="eye-btn">显示</button>
+            </div>
+            <p class="hint" id="key-hint"></p>
+          </div>
+          <div class="form-field">
+            <button id="btn-test" class="btn btn-ghost"></button>
+            <div id="test-result" class="test-result"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title" id="sec-rewrite"></h2>
+        <div class="form-grid">
+          <div class="form-field">
+            <span class="field-label" id="intensity-label"></span>
+            <div class="segmented" id="intensity" role="radiogroup"></div>
+          </div>
+          <div class="form-field">
+            <span class="field-label" id="mode-label"></span>
+            <div class="segmented segmented-2" id="mode" role="radiogroup"></div>
+          </div>
+          <div class="form-field inline">
+            <label for="batchSize"></label>
+            <input id="batchSize" type="number" min="1" max="20" />
+          </div>
+          <div class="form-field inline">
+            <label for="timeoutMs"></label>
+            <input id="timeoutMs" type="number" min="5" max="120" />
+          </div>
+          <div class="form-field checkbox-field">
+            <label class="check-row">
+              <input type="checkbox" id="includeAuthor" />
+              <span id="includeAuthor-label"></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title" id="sec-sites"></h2>
+        <div class="form-field">
+          <div id="site-list"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="section-title" id="sec-data"></h2>
+        <div class="data-row">
+          <div>
+            <p class="data-line" id="cache-info"></p>
+            <p class="hint" id="privacy-note"></p>
+            <p class="hint" id="threat-note"></p>
+          </div>
+          <button id="btn-clear-cache" class="btn btn-ghost"></button>
+        </div>
+        <div class="data-row">
+          <button id="btn-review-onboarding" class="btn-link"></button>
+        </div>
+      </section>
+    </div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

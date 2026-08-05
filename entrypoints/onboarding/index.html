@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kindly Web · 设置引导</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="onb-header">
+        <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+          <path
+            d="M12 8h24a6 6 0 0 1 6 6v16a6 6 0 0 1-6 6H26l-8 6v-6h-6a6 6 0 0 1-6-6V14a6 6 0 0 1 6-6z"
+            fill="currentColor"
+          />
+          <path d="M17 27q7 5 14 0" stroke="#f4f6f3" stroke-width="2.6" fill="none" stroke-linecap="round" />
+        </svg>
+        <h1 class="wordmark">Kindly Web</h1>
+        <button id="btn-skip" class="skip-link"></button>
+      </header>
+
+      <nav class="steps" aria-label="引导步骤">
+        <div class="step-dot-wrap" data-dot="1">
+          <span class="step-dot">1</span><span class="step-name">欢迎</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step-dot-wrap" data-dot="2">
+          <span class="step-dot">2</span><span class="step-name">连接 API</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step-dot-wrap" data-dot="3">
+          <span class="step-dot">3</span><span class="step-name">测试</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step-dot-wrap" data-dot="4">
+          <span class="step-dot">4</span><span class="step-name">偏好</span>
+        </div>
+        <div class="step-line"></div>
+        <div class="step-dot-wrap" data-dot="5">
+          <span class="step-dot">5</span><span class="step-name">完成</span>
+        </div>
+      </nav>
+
+      <main class="card">
+        <!-- Step 1 欢迎 -->
+        <section class="step" data-step="1">
+          <h2 class="step-title"></h2>
+          <p class="step-desc"></p>
+          <ul class="promises">
+            <li id="promise-1"></li>
+            <li id="promise-2"></li>
+            <li id="promise-3"></li>
+          </ul>
+          <div class="step-actions">
+            <button id="step1-next" class="btn btn-primary"></button>
+          </div>
+        </section>
+
+        <!-- Step 2 API 配置 -->
+        <section class="step hidden" data-step="2">
+          <h2 class="step-title"></h2>
+          <p class="step-desc"></p>
+          <div class="provider-grid" id="providers"></div>
+          <div class="form-field">
+            <label for="baseURL" class="field-label"></label>
+            <input id="baseURL" type="url" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-field">
+            <label for="modelName" class="field-label"></label>
+            <input id="modelName" type="text" spellcheck="false" autocomplete="off" />
+          </div>
+          <div class="form-field">
+            <label for="apiKey" class="field-label"></label>
+            <div class="key-row">
+              <input id="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-…（多个 Key 用逗号分隔）" />
+              <button id="key-eye" type="button" class="eye-btn">显示</button>
+            </div>
+            <p class="hint" id="permission-hint"></p>
+            <p class="hint error hidden" id="key-error"></p>
+          </div>
+          <div class="step-actions">
+            <button id="step2-back" class="btn btn-ghost"></button>
+            <button id="step2-next" class="btn btn-primary"></button>
+          </div>
+        </section>
+
+        <!-- Step 3 测试连接 -->
+        <section class="step hidden" data-step="3">
+          <h2 class="step-title"></h2>
+          <p class="step-desc"></p>
+          <button id="btn-test" class="btn btn-primary"></button>
+          <div id="test-result" class="test-result"></div>
+          <div class="step-actions">
+            <button id="step3-back" class="btn btn-ghost"></button>
+            <button id="step3-next" class="btn btn-primary"></button>
+          </div>
+        </section>
+
+        <!-- Step 4 偏好 -->
+        <section class="step hidden" data-step="4">
+          <h2 class="step-title"></h2>
+          <p class="step-desc"></p>
+          <div class="field">
+            <span class="field-label" id="intensity-label"></span>
+            <div class="choice-grid" id="intensity-cards" role="radiogroup"></div>
+          </div>
+          <div class="field">
+            <span class="field-label" id="mode-label"></span>
+            <div class="choice-grid" id="mode-cards" role="radiogroup"></div>
+          </div>
+          <div class="field">
+            <span class="field-label" id="sites-label"></span>
+            <div id="site-list"></div>
+          </div>
+          <div class="step-actions">
+            <button id="step4-back" class="btn btn-ghost"></button>
+            <button id="step4-next" class="btn btn-primary"></button>
+          </div>
+        </section>
+
+        <!-- Step 5 完成 -->
+        <section class="step hidden" data-step="5">
+          <h2 class="step-title"></h2>
+          <p class="step-desc"></p>
+          <div class="done-mark" aria-hidden="true">✓</div>
+          <div class="step-actions">
+            <button id="step5-cta" class="btn btn-primary"></button>
+            <button id="step5-options" class="btn btn-ghost"></button>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

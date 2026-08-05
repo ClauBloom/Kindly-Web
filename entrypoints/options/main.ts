@@ -1,0 +1,240 @@
+/**
+ * 配置页：API 设置 / 重写偏好 / 站点管理 / 数据与隐私。
+ * 保存 → storage 写入 + 通知 SW（KW_CONFIG_CHANGED），SW 再广播给各标签页。
+ */
+
+import { browser } from 'wxt/browser';
+import { cacheClear, cacheSize } from '@/lib/cache';
+import {
+  getApiKey,
+  getConfig,
+  hasOriginAccess,
+  PROVIDER_PRESETS,
+  requestOriginAccess,
+  saveConfig,
+  setApiKey,
+} from '@/lib/config';
+import type { Intensity, KindlyConfig, UIMode } from '@/lib/config';
+import { t } from '@/lib/i18n';
+import { allAdapters } from '@/lib/sites/registry';
+import type { TestResult } from '@/lib/messages';
+
+function $(id: string): HTMLElement {
+  return document.getElementById(id)!;
+}
+
+let config: KindlyConfig;
+let savedKey = '';
+
+async function main(): Promise<void> {
+  config = await getConfig();
+  savedKey = await getApiKey();
+
+  // 文案
+  document.querySelector('.subtitle')!.textContent = t('brand.privacy');
+  $('btn-save').textContent = t('btn.save');
+  $('sec-api').textContent = t('opt.api.title');
+  $('sec-rewrite').textContent = t('opt.rewrite.title');
+  $('sec-sites').textContent = t('opt.sites.title');
+  $('sec-data').textContent = t('opt.data.title');
+  (document.querySelector('label[for="provider"]') as HTMLElement).textContent = t('opt.api.provider');
+  (document.querySelector('label[for="baseURL"]') as HTMLElement).textContent = t('opt.api.baseURL');
+  (document.querySelector('label[for="modelName"]') as HTMLElement).textContent = t('opt.api.model');
+  (document.querySelector('label[for="apiKey"]') as HTMLElement).textContent = t('opt.api.key');
+  $('intensity-label').textContent = t('popup.intensity');
+  $('mode-label').textContent = t('onb.step4.mode');
+  (document.querySelector('label[for="batchSize"]') as HTMLElement).textContent = t('opt.rewrite.batchSize');
+  (document.querySelector('label[for="timeoutMs"]') as HTMLElement).textContent = t('opt.rewrite.timeout');
+  $('includeAuthor-label').textContent = t('opt.rewrite.includeAuthor');
+  $('btn-test').textContent = t('btn.test');
+  $('btn-clear-cache').textContent = t('opt.data.clearCache');
+  $('btn-review-onboarding').textContent = t('opt.data.reviewOnboarding');
+  $('privacy-note').textContent = t('opt.data.privacy');
+  $('threat-note').textContent = t('opt.data.threat');
+
+  // 表单填充
+  buildProviderSelect();
+  buildSegmented('intensity', ['mild', 'moderate', 'strong'], config.intensity, (v) => {
+    config.intensity = v as Intensity;
+  });
+  buildSegmented('mode', ['replace', 'bubble'], config.mode, (v) => {
+    config.mode = v as UIMode;
+  });
+  const baseURLInput = $('baseURL') as HTMLInputElement;
+  baseURLInput.value = config.baseURL;
+  ($('modelName') as HTMLInputElement).value = config.modelName;
+  ($('apiKey') as HTMLInputElement).value = savedKey;
+  ($('batchSize') as HTMLInputElement).value = String(config.batchSize);
+  ($('timeoutMs') as HTMLInputElement).value = String(Math.round(config.timeoutMs / 1000));
+  ($('includeAuthor') as HTMLInputElement).checked = config.includeAuthor;
+  buildSiteList();
+  updateKeyHint();
+
+  void refreshCacheInfo();
+
+  // 事件
+  ($('provider') as HTMLSelectElement).addEventListener('change', onProviderChange);
+  baseURLInput.addEventListener('input', updateKeyHint);
+  ($('key-eye') as HTMLButtonElement).addEventListener('click', () => {
+    const input = $('apiKey') as HTMLInputElement;
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    $('key-eye').textContent = show ? '隐藏' : '显示';
+  });
+  $('btn-test').addEventListener('click', () => void runTest());
+  $('btn-save').addEventListener('click', () => void save());
+  $('btn-clear-cache').addEventListener('click', () => void clearCache());
+  $('btn-review-onboarding').addEventListener('click', () => {
+    void browser.tabs.create({ url: browser.runtime.getURL('/onboarding.html') });
+  });
+}
+
+function buildProviderSelect(): void {
+  const select = $('provider') as HTMLSelectElement;
+  for (const preset of PROVIDER_PRESETS) {
+    const opt = document.createElement('option');
+    opt.value = preset.id;
+    opt.textContent = preset.label;
+    select.appendChild(opt);
+  }
+  const preset = PROVIDER_PRESETS.find((p) => p.baseURL === config.baseURL);
+  select.value = preset?.id ?? 'custom';
+}
+
+function onProviderChange(): void {
+  const id = ($('provider') as HTMLSelectElement).value;
+  const preset = PROVIDER_PRESETS.find((p) => p.id === id);
+  if (!preset) return;
+  ($('baseURL') as HTMLInputElement).value = preset.baseURL;
+  ($('modelName') as HTMLInputElement).value = preset.defaultModel;
+  updateKeyHint();
+}
+
+function buildSegmented(id: string, values: string[], current: string, onChange: (v: string) => void): void {
+  const box = $(id);
+  for (const value of values) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'seg-btn' + (value === current ? ' active' : '');
+    btn.dataset.value = value;
+    btn.textContent = t(value === 'replace' || value === 'bubble' ? `onb.step4.mode.${value}` : `popup.intensity.${value}`);
+    btn.title = t(value === 'replace' || value === 'bubble' ? `onb.step4.mode.${value}.desc` : `intensity.${value}.desc`);
+    btn.addEventListener('click', () => {
+      for (const b of box.querySelectorAll('.seg-btn')) b.classList.remove('active');
+      btn.classList.add('active');
+      onChange(value);
+    });
+    box.appendChild(btn);
+  }
+}
+
+function updateKeyHint(): void {
+  const hint = $('key-hint');
+  if (savedKey) {
+    hint.textContent = t('opt.api.key.hint', { tail: savedKey.slice(-4) });
+  } else {
+    hint.textContent = '';
+  }
+}
+
+/** 站点管理：由 lib/sites/registry.ts 驱动，新增平台自动出现 */
+function buildSiteList(): void {
+  const container = $('site-list');
+  container.innerHTML = '';
+  for (const site of allAdapters()) {
+    const label = document.createElement('label');
+    label.className = 'check-row site-row';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.dataset.siteKey = site.key;
+    checkbox.checked = config.enabledSites.includes(site.key);
+    const span = document.createElement('span');
+    span.textContent = site.label;
+    label.append(checkbox, span);
+    container.appendChild(label);
+  }
+}
+
+async function save(): Promise<void> {
+  const baseURL = ($('baseURL') as HTMLInputElement).value.trim();
+  const key = ($('apiKey') as HTMLInputElement).value.trim();
+  const modelName = ($('modelName') as HTMLInputElement).value.trim();
+  const batchSize = Number(($('batchSize') as HTMLInputElement).value);
+  const timeoutSec = Number(($('timeoutMs') as HTMLInputElement).value);
+  if (!baseURL || !modelName) return toast('请填写接口地址与模型名称');
+  if (!Number.isFinite(batchSize) || batchSize < 1 || batchSize > 20) return toast('每批评论数需在 1–20 之间');
+  if (!Number.isFinite(timeoutSec) || timeoutSec < 5 || timeoutSec > 120) return toast('请求超时需在 5–120 秒之间');
+
+  // 自定义域名权限（用户手势内）
+  if (!(await hasOriginAccess(baseURL))) {
+    const granted = await requestOriginAccess(baseURL);
+    if (!granted) return toast('未授权该地址的网络权限，已取消保存');
+  }
+
+  if (key) savedKey = key;
+  const checkedSites = Array.from(
+    document.querySelectorAll<HTMLInputElement>('#site-list input[type="checkbox"]:checked'),
+  ).map((c) => c.dataset.siteKey ?? '')
+    .filter(Boolean);
+  await Promise.all([
+    setApiKey(key),
+    saveConfig({
+      baseURL,
+      modelName,
+      batchSize,
+      timeoutMs: timeoutSec * 1000,
+      includeAuthor: ($('includeAuthor') as HTMLInputElement).checked,
+      enabledSites: checkedSites,
+    }),
+  ]);
+  updateKeyHint();
+  void browser.runtime.sendMessage({ type: 'KW_CONFIG_CHANGED' }).catch(() => {});
+  toast(t('btn.saved'));
+}
+
+async function runTest(): Promise<void> {
+  const btn = $('btn-test') as HTMLButtonElement;
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = t('btn.testing');
+  const result = $('test-result');
+  result.className = 'test-result';
+  result.textContent = '';
+  try {
+    const res = (await browser.runtime.sendMessage({ type: 'KW_TEST_CONNECTION' })) as TestResult | null;
+    if (!res) {
+      result.textContent = t('onb.step3.fail', { reason: t('err.network') });
+      result.classList.add('fail');
+    } else if (res.ok) {
+      result.textContent = t('onb.step3.ok', { model: res.model ?? '', latency: res.latencyMs ?? 0 });
+      result.classList.add('ok');
+    } else {
+      result.textContent = t('onb.step3.fail', { reason: t(`err.${res.error ?? 'network'}`) });
+      result.classList.add('fail');
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+async function clearCache(): Promise<void> {
+  await cacheClear();
+  await refreshCacheInfo();
+  toast(t('opt.data.clearCache'));
+}
+
+async function refreshCacheInfo(): Promise<void> {
+  $('cache-info').textContent = t('opt.data.cache', { count: await cacheSize() });
+}
+
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+function toast(text: string): void {
+  const el = $('save-toast');
+  el.textContent = text;
+  el.classList.remove('hidden');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 2500);
+}
+
+void main();

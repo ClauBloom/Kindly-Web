@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# WXT 构建产物
+.output/
+.wxt/
+
+# 环境变量与本地密钥（绝不提交）
+.env
+.env.*
+*.local
+
+# 设计参考仓库（kiss-translator / openai-translator 等，仅本地参考，不纳入版本库）
+references/
+
+# 截图 / 临时文件
+screenshots/
+*.log
+tmp/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
