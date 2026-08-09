@@ -16,12 +16,12 @@ import type { SiteAdapter } from '@/lib/sites/types';
 import type { CommentItem } from '@/lib/messages';
 import type { KindlyConfig } from '@/lib/config';
 
-/** 弹幕批量改写等待上限（含 SW 排队时间）：全量并发后放宽，超时放弃（弹幕保持原文） */
+/** 弹幕批量改写等待上限（含 SW 排队时间），超时放弃（弹幕保持原文） */
 const BATCH_TIMEOUT_MS = 45_000;
-/** 弹幕每批条数（LLM 单请求容量；全量模式按此分批） */
-const DM_BATCH_SIZE = 40;
-/** 段内弹幕批并发上限（"多线程"：同时多批在飞，避免排队等结果） */
-const DM_MAX_INFLIGHT = 4;
+
+/** 弹幕批大小与并发（经桥从配置同步；同步前用默认值） */
+let dmBatchSize = 40;
+let dmConcurrency = 16;
 
 /** 改写结果缓存（id → 友善版），供弹幕段重载时直接替换 */
 const rewriteCache = new Map<string, string>();
@@ -34,17 +34,17 @@ let dmQueuedBatches: { id: string; text: string }[][] = [];
 /** 段内在飞的批数 */
 let dmInflight = 0;
 
-/** 全量弹幕分批入队（按 DM_BATCH_SIZE 切批；pendingIds 已过滤） */
+/** 全量弹幕分批入队（按当前配置的批大小切批；pendingIds 已过滤） */
 function queueDanmakuBatches(elems: { id: string; text: string }[]): void {
-  for (let i = 0; i < elems.length; i += DM_BATCH_SIZE) {
-    dmQueuedBatches.push(elems.slice(i, i + DM_BATCH_SIZE));
+  for (let i = 0; i < elems.length; i += dmBatchSize) {
+    dmQueuedBatches.push(elems.slice(i, i + dmBatchSize));
   }
   pumpDanmakuBatches();
 }
 
-/** 管道泵：在飞批数不足时补发下一批（并发 = "多线程"语义） */
+/** 管道泵：在飞批数不足时补发下一批（并发 = 用户配置的并发量） */
 function pumpDanmakuBatches(): void {
-  while (dmInflight < DM_MAX_INFLIGHT && dmQueuedBatches.length > 0) {
+  while (dmInflight < dmConcurrency && dmQueuedBatches.length > 0) {
     const batch = dmQueuedBatches.shift();
     if (!batch) break;
     dmInflight++;
@@ -86,6 +86,9 @@ async function syncMainConfig(): Promise<void> {
         hideOriginalComment: res.config.hideOriginalComment,
         hideOriginalDanmaku: res.config.hideOriginalDanmaku,
       };
+      // 弹幕批大小/并发也由配置驱动（用户可选速度预设或自定义）
+      dmBatchSize = res.config.dmBatchSize;
+      dmConcurrency = res.config.dmConcurrency;
       // 配置变化后重新同步屏上弹幕占位状态（隐藏开启时把已加载原文替换为占位）
       adapterDanmaku?.onConfigChanged?.(mainConfig.hideOriginalDanmaku);
     }

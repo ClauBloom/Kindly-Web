@@ -40,7 +40,26 @@ export interface KindlyConfig {
   hideOriginalComment: boolean;
   /** 改写前隐藏原文（弹幕）：同评论，弹幕显示"重写中"占位 */
   hideOriginalDanmaku: boolean;
+  /** 弹幕处理速度预设（fast/balanced/standard/slow；手动调并发或批大小后为 custom） */
+  dmPreset: 'fast' | 'balanced' | 'standard' | 'slow' | 'custom';
+  /** 弹幕请求并发量（SW 全局并发 + 段内批并发共用；1–128） */
+  dmConcurrency: number;
+  /** 弹幕每批条数（小批响应快、请求多；1–100） */
+  dmBatchSize: number;
 }
+
+/** 弹幕处理速度预设（快速 → 慢速）：高并发+小批 到 低并发+大批 */
+export const DM_SPEED_PRESETS: Record<
+  'fast' | 'balanced' | 'standard' | 'slow',
+  { label: string; concurrency: number; batchSize: number }
+> = {
+  fast: { label: '快速', concurrency: 64, batchSize: 10 },
+  balanced: { label: '较快', concurrency: 32, batchSize: 20 },
+  standard: { label: '标准', concurrency: 16, batchSize: 40 },
+  slow: { label: '慢速', concurrency: 8, batchSize: 60 },
+};
+
+export type DmSpeedPreset = keyof typeof DM_SPEED_PRESETS | 'custom';
 
 export const CURRENT_CONFIG_VERSION = 1;
 
@@ -59,6 +78,9 @@ export const DEFAULT_CONFIG: KindlyConfig = {
   danmakuMaxTotal: 10_000,
   hideOriginalComment: false,
   hideOriginalDanmaku: false,
+  dmPreset: 'standard',
+  dmConcurrency: 16,
+  dmBatchSize: 40,
 };
 
 /**

@@ -7,6 +7,7 @@ import { browser } from 'wxt/browser';
 import { cacheClear, cacheSize } from '@/lib/cache';
 import {
   DANMAKU_MAX_OPTIONS,
+  DM_SPEED_PRESETS,
   getApiKey,
   getConfig,
   hasOriginAccess,
@@ -47,6 +48,9 @@ async function main(): Promise<void> {
   (document.querySelector('label[for="batchSize"]') as HTMLElement).textContent = t('opt.rewrite.batchSize');
   (document.querySelector('label[for="timeoutMs"]') as HTMLElement).textContent = t('opt.rewrite.timeout');
   (document.querySelector('label[for="danmakuMaxTotal"]') as HTMLElement).textContent = t('opt.rewrite.danmakuMaxTotal');
+  (document.querySelector('label[for="dmConcurrency"]') as HTMLElement).textContent = t('opt.rewrite.dmConcurrency');
+  (document.querySelector('label[for="dmBatchSize"]') as HTMLElement).textContent = t('opt.rewrite.dmBatchSize');
+  $('dmSpeed-label').textContent = t('opt.rewrite.dmSpeed');
   $('includeAuthor-label').textContent = t('opt.rewrite.includeAuthor');
   $('hideOriginalComment-label').textContent = t('opt.rewrite.hideOriginalComment');
   $('hideOriginalDanmaku-label').textContent = t('opt.rewrite.hideOriginalDanmaku');
@@ -73,6 +77,7 @@ async function main(): Promise<void> {
   ($('includeAuthor') as HTMLInputElement).checked = config.includeAuthor;
   ($('hideOriginalComment') as HTMLInputElement).checked = config.hideOriginalComment;
   ($('hideOriginalDanmaku') as HTMLInputElement).checked = config.hideOriginalDanmaku;
+  buildDmSpeedControls(config);
   buildDanmakuMaxTotalSelect(config.danmakuMaxTotal);
   buildSiteList();
   updateKeyHint();
@@ -106,6 +111,46 @@ function buildProviderSelect(): void {
   }
   const preset = PROVIDER_PRESETS.find((p) => p.baseURL === config.baseURL);
   select.value = preset?.id ?? 'custom';
+}
+
+/**
+ * 弹幕处理速度：四档预设（快速→慢速）+ 手动并发/批大小。
+ * 选择预设 → 填充两个输入；手动改任一输入 → 档位变"自定义"。
+ */
+function buildDmSpeedControls(current: KindlyConfig): void {
+  const presets = DM_SPEED_PRESETS;
+  const box = $('dm-speed');
+  box.innerHTML = '';
+  const presetKeys = Object.keys(presets) as (keyof typeof presets)[];
+  for (const key of presetKeys) {
+    const p = presets[key];
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'seg-btn' + (current.dmPreset === key ? ' active' : '');
+    btn.textContent = p.label;
+    btn.title = `${t('opt.rewrite.dmSpeedHint')}：并发 ${p.concurrency} · 每批 ${p.batchSize} 条`;
+    btn.setAttribute('role', 'radio');
+    btn.setAttribute('aria-checked', String(current.dmPreset === key));
+    btn.addEventListener('click', () => {
+      ($('dmConcurrency') as HTMLInputElement).value = String(p.concurrency);
+      ($('dmBatchSize') as HTMLInputElement).value = String(p.batchSize);
+      markDmPresetActive(key);
+    });
+    box.appendChild(btn);
+  }
+  ($('dmConcurrency') as HTMLInputElement).value = String(current.dmConcurrency);
+  ($('dmBatchSize') as HTMLInputElement).value = String(current.dmBatchSize);
+  const conInput = $('dmConcurrency') as HTMLInputElement;
+  const batchInput = $('dmBatchSize') as HTMLInputElement;
+  const markCustom = () => markDmPresetActive(null);
+  conInput.addEventListener('input', markCustom);
+  batchInput.addEventListener('input', markCustom);
+}
+
+function markDmPresetActive(key: keyof typeof DM_SPEED_PRESETS | null): void {
+  for (const btn of $('dm-speed').querySelectorAll('.seg-btn')) {
+    btn.classList.toggle('active', key !== null && btn.textContent === DM_SPEED_PRESETS[key].label);
+  }
 }
 
 /** 弹幕处理上限下拉（null = 无上限）——选项定义共享自 lib/config.ts */
@@ -197,6 +242,14 @@ async function save(): Promise<void> {
     document.querySelectorAll<HTMLInputElement>('#site-list input[type="checkbox"]:checked'),
   ).map((c) => c.dataset.siteKey ?? '')
     .filter(Boolean);
+  const dmConcurrency = Number(($('dmConcurrency') as HTMLInputElement).value);
+  const dmBatchSize = Number(($('dmBatchSize') as HTMLInputElement).value);
+  if (!Number.isFinite(dmConcurrency) || dmConcurrency < 1 || dmConcurrency > 128) return toast('并发量需在 1–128 之间');
+  if (!Number.isFinite(dmBatchSize) || dmBatchSize < 1 || dmBatchSize > 100) return toast('每批弹幕数需在 1–100 之间');
+  // 手动值恰好匹配某预设 → 记为该预设；否则自定义
+  const presetMatch = (Object.keys(DM_SPEED_PRESETS) as (keyof typeof DM_SPEED_PRESETS)[]).find(
+    (k) => DM_SPEED_PRESETS[k].concurrency === dmConcurrency && DM_SPEED_PRESETS[k].batchSize === dmBatchSize,
+  );
   await Promise.all([
     setApiKey(key),
     saveConfig({
@@ -209,6 +262,9 @@ async function save(): Promise<void> {
       hideOriginalDanmaku: ($('hideOriginalDanmaku') as HTMLInputElement).checked,
       enabledSites: checkedSites,
       danmakuMaxTotal,
+      dmPreset: presetMatch ?? 'custom',
+      dmConcurrency,
+      dmBatchSize,
       onboardingDone: true,
     }),
   ]);

@@ -20,9 +20,13 @@ import { classifyFetchError, classifyHttpStatus, extractErrorDetail } from '@/li
 import { parseRewrites } from '@/lib/response-parser';
 import type { CommentItem, RewriteReason, RuntimeMessage, StatusPayload } from '@/lib/messages';
 
-const MAX_CONCURRENCY = 8;
+/**
+ * 全局请求并发上限（动态：由配置 dmConcurrency 驱动，用户可选速度预设或自定义；
+ * schedule 每次读取配置后更新，首个请求前用默认值）
+ */
+let maxConcurrency = 16;
 /** 最小请求间隔（ms）：并发之外的第二道限流，防持续密集请求触发服务商封禁 */
-const MIN_REQUEST_INTERVAL_MS = 200;
+const MIN_REQUEST_INTERVAL_MS = 50;
 const MAX_NETWORK_RETRIES = 2;
 /** parse 失败重试次数（模型偶发空响应/格式错误，重试一次成本低收益高） */
 const MAX_PARSE_RETRIES = 1;
@@ -233,7 +237,7 @@ function deliverResult(tabId: number, item: PendingItem | CommentItem, rewritten
 }
 
 function nextBatch(config: KindlyConfig): Batch | null {
-  if (inFlight.size >= MAX_CONCURRENCY || authFailed || Date.now() < pausedUntil) return null;
+  if (inFlight.size >= maxConcurrency || authFailed || Date.now() < pausedUntil) return null;
   const tabIds = [...queues.keys()];
   if (tabIds.length === 0) return null;
   for (let i = 0; i < tabIds.length; i++) {
@@ -280,8 +284,9 @@ async function schedule(): Promise<void> {
     return;
   }
   const config = await getConfig();
+  maxConcurrency = Math.min(128, Math.max(1, config.dmConcurrency));
   void drainBackoff(Date.now());
-  while (inFlight.size < MAX_CONCURRENCY) {
+  while (inFlight.size < maxConcurrency) {
     const batch = nextBatch(config);
     if (!batch) break;
     void fire(batch);
@@ -291,7 +296,7 @@ async function schedule(): Promise<void> {
 /** 退避队列：到期（backoffUntil 字段由调用方在放回时记录在对象上）直接重发原批
  * （保留 attempts 计数——放回队列再重建会重置 attempts，导致重试无限循环） */
 async function drainBackoff(now: number): Promise<void> {
-  for (let i = backoffQueue.length - 1; i >= 0 && inFlight.size < MAX_CONCURRENCY; i--) {
+  for (let i = backoffQueue.length - 1; i >= 0 && inFlight.size < maxConcurrency; i--) {
     const batch = backoffQueue[i];
     if (!batch) continue;
     const until = (batch as Batch & { backoffUntil?: number }).backoffUntil ?? 0;

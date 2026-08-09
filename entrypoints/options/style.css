@@ -253,6 +253,10 @@ select {
   grid-template-columns: repeat(2, 1fr);
 }
 
+.segmented-4 {
+  grid-template-columns: repeat(4, 1fr);
+}
+
 .seg-btn {
   padding: 9px 6px;
   border: 1.5px solid var(--line);
