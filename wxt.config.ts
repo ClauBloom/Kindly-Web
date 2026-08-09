@@ -8,6 +8,11 @@ const BASE_HOST_PERMISSIONS = [
 ];
 
 export default defineConfig({
+  // MV3 扩展页对 modulepreload 有限制（cross-world extension resource mismatch 警告），
+  // 关闭 Vite 的 preload 生成，避免控制台噪音（页面脚本仍正常加载）
+  vite: () => ({
+    build: { modulePreload: false },
+  }),
   manifest: (env) => ({
     name: 'Kindly Web',
     description: '将网络评论中的攻击性表达重写为友善表达。评论原文仅发送至你自行配置的 LLM API。',

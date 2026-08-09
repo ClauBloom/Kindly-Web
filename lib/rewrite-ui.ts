@@ -37,14 +37,19 @@ interface Entry {
   status: 'pending' | 'success' | 'error';
   sentAt: number;
   rewritten?: string;
-  /** 评论在渲染列表中的顺序索引（B 站新版按 seq 定位） */
+  /** 评论在渲染列表中的顺序索引（B 站按 seq 定位） */
   seq?: number;
+  /** 隐藏原文模式：已替换为"重写中"占位（失败/还原时恢复原文） */
+  hiddenOriginal?: boolean;
 }
 
 let adapter: SiteAdapter | null = null;
 const registry = new Map<string, Entry>();
 /** 结果先于 DOM 渲染到达时的重试队列（mock/快速模型/大页面场景的竞态修复） */
 const pendingResults = new Map<string, { rewritten: string; seq?: number; attempts: number }>();
+
+/** 隐藏模式占位文本（改写前不显示原文） */
+const PENDING_PLACEHOLDER = '重写中';
 const pendingErrors = new Map<string, { reason: RewriteReason; detail?: string; seq?: number; attempts: number }>();
 const PENDING_RETRY_MAX = 12; // 12 × 500ms ≈ 6s 窗口
 const PENDING_RETRY_INTERVAL_MS = 500;
@@ -78,9 +83,35 @@ export function startRewriteUi(site: SiteAdapter): void {
       case 'KW_HIJACK_ACTIVE':
         onHijackActive();
         break;
+      case 'KW_COMMENTS_PENDING':
+        // 劫持路径的评论已送改写：登记处理中集合，已渲染的条目立即占位
+        onCommentsPending(msg.items);
+        break;
+      case 'KW_FAILURE_LOG':
+        // SW 改写失败详情 → 页面 DevTools console（面向开发者定位）
+        console.log(
+          `[Kindly Web] 改写失败 · ${msg.kind === 'danmaku' ? '弹幕' : '评论'} · 原因: ${msg.reason} · 重试: ${msg.attempts}次 · 时间: ${new Date().toISOString()} · 接口: ${msg.baseURL} · 模型: ${msg.modelName}`,
+          {
+            条目: msg.ids.map((id: string, i: number) => ({ id, 原文: msg.originals[i] })),
+            请求返回内容: msg.detail,
+          },
+        );
+        break;
     }
   });
   void init();
+}
+
+/** 已送改写、结果未回的评论 id（隐藏原文模式占位用） */
+const pendingCommentIds = new Set<string>();
+
+function onCommentsPending(items: { id: string; seq?: number }[]): void {
+  for (const item of items) pendingCommentIds.add(item.id);
+  if (!config?.hideOriginalComment) return;
+  for (const item of items) {
+    const entry = resolveEntry(item.id, item.seq);
+    if (entry && entry.status === 'pending') applyPendingPlaceholder(entry);
+  }
 }
 
 async function init(): Promise<void> {
@@ -157,7 +188,7 @@ function onScroll(): void {
 }
 
 // ===== shadow DOM 穿透查询 =====
-// B 站新版评论区渲染在 <bili-comments> 的 Lit shadow root 内，
+// B 站评论区渲染在 <bili-comments> 的 Lit shadow root 内，
 // document.querySelector 查不到 → 所有定位/采集必须穿透 shadow。
 
 /** 递归收集元素及其所有 shadow root 内匹配选择器的元素 */
@@ -239,13 +270,32 @@ async function flushBatch(): Promise<void> {
   pendingItems = [];
   for (const item of items) {
     const entry = registry.get(item.id);
-    if (entry) entry.sentAt = Date.now();
+    if (entry) {
+      entry.sentAt = Date.now();
+      // 隐藏原文模式：改写完成前不显示原文（占位"重写中"）
+      if (config?.hideOriginalComment) applyPendingPlaceholder(entry);
+    }
   }
   try {
     await browser.runtime.sendMessage({ type: 'KW_REWRITE_COMMENTS', items });
   } catch {
     restoreAll();
   }
+}
+
+/** 隐藏模式：把评论文本替换为"重写中"占位（原文不外露；失败/还原时恢复） */
+function applyPendingPlaceholder(entry: Entry): void {
+  if (entry.hiddenOriginal) return;
+  entry.hiddenOriginal = true;
+  mutateText(entry, () => {
+    const [first, ...rest] = entry.textNodes;
+    if (first) {
+      first.textContent = PENDING_PLACEHOLDER;
+      for (const node of rest) node.textContent = '';
+    } else {
+      entry.contentEl.textContent = PENDING_PLACEHOLDER;
+    }
+  });
 }
 
 /** SW 休眠/被杀导致结果丢失时，超时重新上报（幂等：SW 侧缓存去重） */
@@ -298,6 +348,8 @@ function collectEntry(root: HTMLElement, id: string, seq?: number): Entry | null
   const entry: Entry = { root, contentEl, textNodes, fallbackText, original, status: 'pending', sentAt: 0, seq };
   root.dataset.kwId = id;
   registry.set(id, entry);
+  // 隐藏原文模式：该评论已送改写（劫持路径广播）→ 立即占位（渲染晚于发送的竞态）
+  if (config?.hideOriginalComment && pendingCommentIds.has(id)) applyPendingPlaceholder(entry);
   return entry;
 }
 
@@ -321,6 +373,8 @@ function applyResult(id: string, rewritten: string, seq?: number): void {
   if (entry.status !== 'pending') return;
   entry.status = 'success';
   entry.rewritten = rewritten;
+  entry.hiddenOriginal = false;
+  pendingCommentIds.delete(id);
   applyVisual(entry, rewritten);
 }
 
@@ -340,6 +394,7 @@ function schedulePendingRetry(): void {
         pendingResults.delete(id);
         entry.status = 'success';
         entry.rewritten = p.rewritten;
+        entry.hiddenOriginal = false;
         applyVisual(entry, p.rewritten);
       }
     }
@@ -410,6 +465,7 @@ function restoreText(entry: Entry): void {
 
 /** 失败角标：点击展开可交互浮层（原因 + 原始错误 + 重试） */
 function applyError(id: string, reason: RewriteReason, detail?: string, seq?: number): void {
+  pendingCommentIds.delete(id);
   const entry = resolveEntry(id, seq);
   if (!entry) {
     if (!pendingErrors.has(id)) {
@@ -424,6 +480,11 @@ function applyError(id: string, reason: RewriteReason, detail?: string, seq?: nu
 
 function applyErrorToEntry(entry: Entry, reason: RewriteReason, detail?: string): void {
   entry.status = 'error';
+  // 隐藏模式占位中：失败恢复原文（+ 失败角标），避免永久"重写中"
+  if (entry.hiddenOriginal) {
+    entry.hiddenOriginal = false;
+    restoreText(entry);
+  }
   const badge = document.createElement('span');
   badge.className = 'kw-badge';
   // shadow DOM 内不受全局 CSS 影响 → 关键样式内联（流式布局，不依赖定位上下文）

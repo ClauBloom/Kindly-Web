@@ -1,6 +1,6 @@
 /**
  * 用户配置读写 + Provider 预置表。
- * 存储拆分（见 docs/ARCHITECTURE.md §2.5）：
+ * 存储拆分：
  *  - apiKey            → chrome.storage.local（敏感凭据，不跨设备扩散）
  *  - KindlyConfig      → chrome.storage.sync（非敏感偏好）
  */
@@ -31,6 +31,15 @@ export interface KindlyConfig {
   enabledSites: string[];
   /** 初次引导完成标记（未完成 → popup 显示引导 CTA） */
   onboardingDone: boolean;
+  /**
+   * 弹幕处理上限：视频弹幕总量（stat.danmaku）大于此值时跳过弹幕改写
+   * （弹幕量极大的视频通常引战少，全量送 LLM 不划算）。null = 无上限。
+   */
+  danmakuMaxTotal: number | null;
+  /** 改写前隐藏原文（评论）：加载即显示"重写中"占位，改写完成后替换 */
+  hideOriginalComment: boolean;
+  /** 改写前隐藏原文（弹幕）：同评论，弹幕显示"重写中"占位 */
+  hideOriginalDanmaku: boolean;
 }
 
 export const CURRENT_CONFIG_VERSION = 1;
@@ -47,6 +56,9 @@ export const DEFAULT_CONFIG: KindlyConfig = {
   includeAuthor: false,
   enabledSites: ['bilibili'],
   onboardingDone: false,
+  danmakuMaxTotal: 10_000,
+  hideOriginalComment: false,
+  hideOriginalDanmaku: false,
 };
 
 /**
@@ -64,6 +76,20 @@ export interface ProviderPreset {
   defaultModel: string;
 }
 
+/** 弹幕处理上限下拉选项（null = 无上限；popup 与 options 共用） */
+export const DANMAKU_MAX_OPTIONS: { value: number | null; label: string }[] = [
+  { value: 100, label: '100' },
+  { value: 500, label: '500' },
+  { value: 1000, label: '1000' },
+  { value: 2000, label: '2000' },
+  { value: 5000, label: '5000' },
+  { value: 10000, label: '1万' },
+  { value: 20000, label: '2万' },
+  { value: 50000, label: '5万' },
+  { value: 100000, label: '10万' },
+  { value: null, label: '无上限' },
+];
+
 export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: 'openai',
@@ -77,7 +103,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     label: 'DeepSeek',
     hint: '国产 · 性价比高',
     baseURL: 'https://api.deepseek.com/v1',
-    defaultModel: 'deepseek-chat',
+    defaultModel: 'deepseek-v4-flash',
   },
   {
     id: 'zhipu',
@@ -119,6 +145,8 @@ export async function getConfig(): Promise<KindlyConfig> {
     if (migrate) cfg = migrate(cfg);
   }
   cfg.version = CURRENT_CONFIG_VERSION;
+  // 旧配置中的 deepseek-chat 已不可用，修正为官方当前模型
+  if (cfg.modelName === 'deepseek-chat') cfg.modelName = 'deepseek-v4-flash';
   return cfg;
 }
 

@@ -6,6 +6,7 @@
 import { browser } from 'wxt/browser';
 import { cacheClear, cacheSize } from '@/lib/cache';
 import {
+  DANMAKU_MAX_OPTIONS,
   getApiKey,
   getConfig,
   hasOriginAccess,
@@ -45,7 +46,10 @@ async function main(): Promise<void> {
   $('mode-label').textContent = t('onb.step4.mode');
   (document.querySelector('label[for="batchSize"]') as HTMLElement).textContent = t('opt.rewrite.batchSize');
   (document.querySelector('label[for="timeoutMs"]') as HTMLElement).textContent = t('opt.rewrite.timeout');
+  (document.querySelector('label[for="danmakuMaxTotal"]') as HTMLElement).textContent = t('opt.rewrite.danmakuMaxTotal');
   $('includeAuthor-label').textContent = t('opt.rewrite.includeAuthor');
+  $('hideOriginalComment-label').textContent = t('opt.rewrite.hideOriginalComment');
+  $('hideOriginalDanmaku-label').textContent = t('opt.rewrite.hideOriginalDanmaku');
   $('btn-test').textContent = t('btn.test');
   $('btn-clear-cache').textContent = t('opt.data.clearCache');
   $('btn-review-onboarding').textContent = t('opt.data.reviewOnboarding');
@@ -67,6 +71,9 @@ async function main(): Promise<void> {
   ($('batchSize') as HTMLInputElement).value = String(config.batchSize);
   ($('timeoutMs') as HTMLInputElement).value = String(Math.round(config.timeoutMs / 1000));
   ($('includeAuthor') as HTMLInputElement).checked = config.includeAuthor;
+  ($('hideOriginalComment') as HTMLInputElement).checked = config.hideOriginalComment;
+  ($('hideOriginalDanmaku') as HTMLInputElement).checked = config.hideOriginalDanmaku;
+  buildDanmakuMaxTotalSelect(config.danmakuMaxTotal);
   buildSiteList();
   updateKeyHint();
 
@@ -99,6 +106,18 @@ function buildProviderSelect(): void {
   }
   const preset = PROVIDER_PRESETS.find((p) => p.baseURL === config.baseURL);
   select.value = preset?.id ?? 'custom';
+}
+
+/** 弹幕处理上限下拉（null = 无上限）——选项定义共享自 lib/config.ts */
+function buildDanmakuMaxTotalSelect(current: number | null): void {
+  const select = $('danmakuMaxTotal') as HTMLSelectElement;
+  for (const opt of DANMAKU_MAX_OPTIONS) {
+    const el = document.createElement('option');
+    el.value = opt.value === null ? '' : String(opt.value);
+    el.textContent = opt.label;
+    select.appendChild(el);
+  }
+  select.value = current === null ? '' : String(current);
 }
 
 function onProviderChange(): void {
@@ -161,6 +180,8 @@ async function save(): Promise<void> {
   const modelName = ($('modelName') as HTMLInputElement).value.trim();
   const batchSize = Number(($('batchSize') as HTMLInputElement).value);
   const timeoutSec = Number(($('timeoutMs') as HTMLInputElement).value);
+  const danmakuMaxRaw = ($('danmakuMaxTotal') as HTMLSelectElement).value;
+  const danmakuMaxTotal = danmakuMaxRaw === '' ? null : Number(danmakuMaxRaw);
   if (!baseURL || !modelName) return toast('请填写接口地址与模型名称');
   if (!Number.isFinite(batchSize) || batchSize < 1 || batchSize > 20) return toast('每批评论数需在 1–20 之间');
   if (!Number.isFinite(timeoutSec) || timeoutSec < 5 || timeoutSec > 120) return toast('请求超时需在 5–120 秒之间');
@@ -184,7 +205,11 @@ async function save(): Promise<void> {
       batchSize,
       timeoutMs: timeoutSec * 1000,
       includeAuthor: ($('includeAuthor') as HTMLInputElement).checked,
+      hideOriginalComment: ($('hideOriginalComment') as HTMLInputElement).checked,
+      hideOriginalDanmaku: ($('hideOriginalDanmaku') as HTMLInputElement).checked,
       enabledSites: checkedSites,
+      danmakuMaxTotal,
+      onboardingDone: true,
     }),
   ]);
   updateKeyHint();

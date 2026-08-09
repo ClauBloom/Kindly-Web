@@ -1,5 +1,5 @@
 /**
- * 错误分类（docs/ARCHITECTURE.md §7.2）。
+ * 错误分类。
  * SW 统一把各类失败归类为 RewriteReason，CS 据此降级展示；
  * popup 用同一张表渲染人类可读文案。
  */
@@ -31,16 +31,18 @@ export function classifyParseError(): RewriteReason {
 
 /**
  * 从非 2xx 响应中提取服务商原始错误信息（借鉴 openai-translator 的多层提取：
- * error.message → message → 截断 JSON），供 UI 展示诊断，绝不包含 Key。
+ * error.message → message → 截断 JSON），供 UI 展示与开发者日志定位，绝不包含 Key。
+ * 返回格式：`HTTP <status>: <body>`（status 可空 → 仅 body）。
  */
 export async function extractErrorDetail(res: Response): Promise<string | undefined> {
+  const prefix = `HTTP ${res.status}: `;
   try {
     const data: unknown = await res.json();
     if (!data || typeof data !== 'object') return undefined;
     const v = data as Record<string, unknown>;
     const msg = v.error && typeof v.error === 'object' ? (v.error as Record<string, unknown>).message : v.message;
-    if (typeof msg === 'string' && msg.trim() !== '') return msg.trim().slice(0, 200);
-    return JSON.stringify(data).slice(0, 200);
+    if (typeof msg === 'string' && msg.trim() !== '') return prefix + msg.trim().slice(0, 2000);
+    return prefix + JSON.stringify(data).slice(0, 2000);
   } catch {
     return undefined;
   }

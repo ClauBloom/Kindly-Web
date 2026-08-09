@@ -110,6 +110,16 @@ export function parseRewrites(raw: string, items: ParseItem[]): Map<string, stri
     for (const item of items) if (!map.has(item.id)) map.set(item.id, item.original);
     return map;
   }
+  // 部分模型把 "id" 键写进每个条目（{"id":"<弹幕id>":"text"}，JSON 语法非法）：
+  // 去掉 "id": 前缀后重新解析（仅在首轮失败时尝试，避免误伤正常文本）
+  if (/"id"\s*:\s*"/.test(cleaned)) {
+    const fixed = cleaned.replace(/"id"\s*:\s*(?=")/g, '');
+    const map2 = parseMapping(fixed) ?? parseList(fixed) ?? parseLineProtocol(fixed, items);
+    if (map2) {
+      for (const item of items) if (!map2.has(item.id)) map2.set(item.id, item.original);
+      return map2;
+    }
+  }
   // 单条批次：模型可能直接返回纯文本。仅当内容确实像一段文本时兜底，
   // 避免坏 JSON（以 {/[ 开头但解析失败）或纯符号垃圾被当成改写结果。
   if (items.length === 1 && items[0] && looksLikeText(cleaned)) {

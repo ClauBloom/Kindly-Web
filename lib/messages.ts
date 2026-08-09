@@ -1,8 +1,10 @@
 /**
- * 运行时消息协议（docs/ARCHITECTURE.md §6）。
+ * 运行时消息协议。
  * CommentItem 为 content script ↔ SW 的传输 DTO；DOM 节点不跨消息，
  * CS 侧维护 Map<id, HTMLElement> 注册表，消息只传 id。
  */
+
+import type { KindlyConfig } from './config';
 
 export interface CommentItem {
   /** 发送方保证唯一：评论场景为 rpid 字符串，弹幕场景为 idStr */
@@ -20,7 +22,7 @@ export interface CommentItem {
   /** 弹幕批量请求的聚合 ID（存在时 SW 聚合结果而非逐条回发） */
   requestId?: string;
   /**
-   * 评论在接口响应/页面渲染列表中的顺序索引（B 站新版评论区 DOM 无 rpid 属性，
+   * 评论在接口响应/页面渲染列表中的顺序索引（B 站评论区 DOM 无 rpid 属性，
    * 结果应用按接口顺序 ↔ #feed 内 thread renderer 顺序定位）
    */
   seq?: number;
@@ -31,12 +33,30 @@ export type RewriteReason = NonNullable<CommentItem['error']>;
 export type RuntimeMessage =
   | { type: 'KW_REWRITE_COMMENTS'; items: CommentItem[] } // CS → SW
   | { type: 'KW_REWRITE_BATCH'; requestId: string; kind: 'danmaku'; items: CommentItem[] } // main-world → SW
-  | { type: 'KW_REWRITE_BATCH_RESULT'; requestId: string; results: { id: string; rewritten: string }[] } // SW → tab
+  | {
+      type: 'KW_REWRITE_BATCH_RESULT';
+      requestId: string;
+      results: { id: string; rewritten: string }[];
+      skipped?: boolean; // 整批因阈值跳过（非失败，弹幕保持原文并打"跳过"标识）
+    } // SW → tab
   | { type: 'KW_REWRITE_RESULT'; id: string; rewritten: string; seq?: number } // SW → CS
   | { type: 'KW_REWRITE_ERROR'; id: string; reason: RewriteReason; detail?: string; seq?: number } // SW → CS
+  | {
+      type: 'KW_FAILURE_LOG';
+      kind: 'comment' | 'danmaku';
+      reason: RewriteReason;
+      ids: string[];
+      originals: string[];
+      attempts: number;
+      modelName: string;
+      baseURL: string;
+      detail?: string;
+    } // SW → tab（页面 console 输出，面向开发者定位）
   | { type: 'KW_SET_ENABLED'; enabled: boolean } // popup → SW → tabs
   | { type: 'KW_CONFIG_CHANGED' } // options/onboarding → SW → tabs
   | { type: 'KW_HIJACK_ACTIVE' } // main-world hijack → isolated CS（劫持已生效，跳过 observer 兜底）
+  | { type: 'KW_VIDEO_META'; danmakuTotal: number } // main-world hijack → SW（视频弹幕总量，阈值判断用）
+  | { type: 'KW_COMMENTS_PENDING'; items: { id: string; seq?: number }[] } // main-world hijack → SW → tab（评论已送改写，隐藏原文占位用）
   | { type: 'KW_GET_STATUS' } // popup → SW
   | {
       type: 'KW_STATUS';
@@ -48,6 +68,8 @@ export type RuntimeMessage =
       authFailed: boolean;
       lastError: RewriteReason | null;
     } // SW → popup
+  | { type: 'KW_GET_CONFIG' } // main-world hijack → SW（拉取配置：隐藏原文等 MAIN 侧行为）
+  | { type: 'KW_CONFIG'; config: KindlyConfig } // SW → 请求方（main-world）
   | { type: 'KW_TEST_CONNECTION' } // onboarding/options → SW
   | {
       type: 'KW_TEST_RESULT';

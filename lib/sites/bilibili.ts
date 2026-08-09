@@ -20,11 +20,11 @@ const REPLY_RE = /\/x\/v2\/reply\/(?:wbi\/)?(main|reply)/;
 const SUB_REPLY_RE = /\/x\/v2\/reply\/(?:wbi\/)?reply/;
 
 export const BILIBILI_COMMENT_SELECTORS = {
-  /** 顶层评论线程（B 站新版：仅 #feed 的直接子级；queryShadowAll 负责穿透 shadow） */
+  /** 顶层评论线程（仅 #feed 的直接子级；queryShadowAll 负责穿透 shadow） */
   root: '#feed > bili-comment-thread-renderer',
-  /** 评论文本容器（新版走 resolveContentNode，此处仅作回退） */
+  /** 评论文本容器（resolveContentNode 优先，此处为回退选择器） */
   content: '.reply-content, .reply-content-container, #content',
-  /** 评论者昵称（新版在 bili-comment-user-info 内，回退选择器） */
+  /** 评论者昵称（回退选择器） */
   author: '.user-name, .reply-info .user-name, bili-comment-user-info',
 } as const;
 
@@ -70,7 +70,7 @@ export function resolveBilibiliCommentRoot(id: string, seq?: number): HTMLElemen
       return null;
     }
   }
-  // 旧版 DOM（rpid 属性）回退
+  // rpid 属性查找（seq 定位失败时的回退）
   try {
     return document.querySelector<HTMLElement>(
       `[rpid="${CSS.escape(id)}"], [data-rpid="${CSS.escape(id)}"]`,
@@ -100,4 +100,12 @@ export const bilibiliAdapter: SiteAdapter = {
   resolveCommentRoot: resolveBilibiliCommentRoot,
   resolveContentNode: resolveBilibiliContentNode,
   commentSelectors: BILIBILI_COMMENT_SELECTORS,
+  videoMeta: {
+    matchUrl: (url) => /\/x\/web-interface\/(?:wbi\/)?view/.test(url),
+    extractDanmakuTotal: (data) => {
+      const d = data as { data?: { stat?: { danmaku?: unknown }; View?: { stat?: { danmaku?: unknown } } } };
+      const total = d?.data?.stat?.danmaku ?? d?.data?.View?.stat?.danmaku;
+      return typeof total === 'number' && total > 0 ? total : null;
+    },
+  },
 };

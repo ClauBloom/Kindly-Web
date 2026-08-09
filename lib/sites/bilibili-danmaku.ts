@@ -3,8 +3,11 @@
  *
  * 弹幕改写管道（先放行 → 异步改写 → 屏上替换）的站点侧实现：
  *  - 极简 protobuf 编解码（字段序保留重编码，未知字段字节级保留）
- *  - 屏上替换：深度探测播放器内存弹幕列表（{content, progress} 数组），
- *    改 content 字段 → canvas 每帧重绘友善版（渐进增强，失败即降级）
+ *  - 屏上替换（主通道，实测 2026-08）：B 站弹幕是 DOM 元素
+ *    （.bpx-player-render-dm-wrap 下 .bili-danmaku-x-dm，无 id 属性），
+ *    MutationObserver 按原文文本匹配替换 textContent；状态角标（改/✓/!/跳）
+ *    与隐藏原文占位（"重写中"）也在此层维护
+ *  - probe 回退：播放器内存弹幕列表探测（DOM 观察不可用时兜底）
  *
  * 结构依据 bilibili-API-collect 文档 + 实测（2026-08）：
  *  - seg.so 顶层：field 1 = repeated DanmakuElem（普通弹幕）；field 4/5 = 指令弹幕（原样保留）
@@ -178,7 +181,7 @@ function replaceXmlContent(xml: string, replacements: ReadonlyMap<string, string
   return changed ? out : null;
 }
 
-// ===== 屏上替换（渐进增强）=====
+// ===== 屏上替换与状态标识 =====
 
 interface DanmakuRecord {
   content?: string;
@@ -190,6 +193,156 @@ interface DanmakuRecord {
 
 let liveList: DanmakuRecord[] | null = null;
 let probing = false;
+
+/**
+ * B 站弹幕是 DOM 元素渲染（实测 2026-08）：.bpx-player-render-dm-wrap
+ * 下的 .bili-danmaku-x-dm（文本节点，无 id 属性）→ 只能按原文文本匹配替换。
+ * probe（内存列表探测）仅在 DOM 观察不可用时作为回退。
+ */
+let dmObserver: MutationObserver | null = null;
+let dmContainer: HTMLElement | null = null;
+/** id → 原文（parseResponse 时积累，applyLiveRewrites 借它做文本匹配） */
+const idToText = new Map<string, string>();
+/** 原文 → 改写文本（弹幕 DOM 元素无 id，按文本匹配） */
+const rewriteResults = new Map<string, string>();
+/** 原文 → 发送时间戳（处理中；超时自动降级不显示角标） */
+const pendingTexts = new Map<string, number>();
+/** 原文 → 失败原因（改写失败保持原文，屏上打"失败"角标） */
+const failTexts = new Map<string, string>();
+/** 原文 → 跳过原因（弹幕总量超过处理上限时整批跳过，屏上打"跳过"角标） */
+const skipTexts = new Map<string, string>();
+
+/** 改写前隐藏原文（弹幕）：屏上显示"重写中"占位，改写完成后替换（经桥从 SW 同步） */
+let hideOriginalDanmaku = false;
+/** 占位文本（隐藏模式 + 处理中） */
+const PENDING_PLACEHOLDER = '重写中';
+
+/** 配置变化（hijack-engine 经桥同步后回调）：更新隐藏标志并重扫屏上占位 */
+function onDmConfigChanged(hide: boolean): void {
+  hideOriginalDanmaku = hide;
+  applyDmTextReplacements();
+}
+
+/** 处理中角标超时（毫秒）：超过后不再显示"改"标（结果可能已丢，避免永久悬空） */
+const PENDING_BADGE_TTL_MS = 15_000;
+
+/**
+ * 弹幕状态角标（屏上显示处理情况）：
+ *  - 处理中：灰"改"（已送 LLM，等待结果）
+ *  - 已处理：绿"✓"（文本已替换为友善版）
+ *  - 失败：红"!"（改写失败，保持原文；悬停可见原因）
+ * 弹幕元素是动态池（出现→移动→移除），角标随元素生命周期自然清理。
+ */
+function badgeStyle(bg: string): string {
+  return (
+    'display:inline-block;margin-left:4px;vertical-align:middle;' +
+    `background:${bg};color:#fff;font-size:9px;line-height:1.3;` +
+    'padding:0 3px;border-radius:3px;user-select:none;pointer-events:none;'
+  );
+}
+
+function syncDmBadge(el: HTMLElement, original: string): void {
+  el.querySelector('.kw-dm-badge')?.remove();
+  const now = Date.now();
+  if (rewriteResults.has(original)) {
+    const span = document.createElement('span');
+    span.className = 'kw-dm-badge';
+    span.style.cssText = badgeStyle('#4c7a5c');
+    span.textContent = '✓';
+    el.appendChild(span);
+    return;
+  }
+  const failReason = failTexts.get(original);
+  if (failReason !== undefined) {
+    const span = document.createElement('span');
+    span.className = 'kw-dm-badge';
+    span.style.cssText = badgeStyle('#ff6b6b');
+    span.textContent = '!';
+    span.title = failReason;
+    el.appendChild(span);
+    return;
+  }
+  const skipReason = skipTexts.get(original);
+  if (skipReason !== undefined) {
+    const span = document.createElement('span');
+    span.className = 'kw-dm-badge';
+    span.style.cssText = badgeStyle('#9aa5a0');
+    span.textContent = '跳';
+    span.title = `跳过改写：${skipReason}`;
+    el.appendChild(span);
+    return;
+  }
+  const sentAt = pendingTexts.get(original);
+  if (sentAt !== undefined && now - sentAt < PENDING_BADGE_TTL_MS) {
+    const span = document.createElement('span');
+    span.className = 'kw-dm-badge';
+    span.style.cssText = badgeStyle('#9aa5a0');
+    span.textContent = '改';
+    el.appendChild(span);
+  }
+}
+
+/** 观察弹幕渲染容器：新弹幕元素出现时按文本替换 */
+function startDmDomObserver(maxAttempts = 15, intervalMs = 2000): void {
+  if (dmObserver) return;
+  let attempts = 0;
+  const tick = () => {
+    if (dmObserver) return;
+    const el = document.querySelector<HTMLElement>('.bpx-player-render-dm-wrap');
+    if (el) {
+      dmContainer = el;
+      dmObserver = new MutationObserver(() => applyDmTextReplacements());
+      dmObserver.observe(el, { childList: true, subtree: true });
+      applyDmTextReplacements();
+      return;
+    }
+    if (++attempts > maxAttempts) return;
+    setTimeout(tick, intervalMs);
+  };
+  tick();
+}
+
+/** 按原文匹配现存/新增弹幕 DOM 元素并替换为改写文本 */
+function applyDmTextReplacements(): void {
+  if (!dmContainer) return;
+  const now = Date.now();
+  const els = dmContainer.querySelectorAll<HTMLElement>('.bili-danmaku-x-dm');
+  for (const el of els) {
+    // 占位元素用 dataset 记录原文；普通元素用当前文本
+    const orig = el.dataset.kwDmOrig ?? el.textContent?.trim() ?? '';
+    if (orig === '') continue;
+    const rewritten = rewriteResults.get(orig);
+    if (rewritten !== undefined && el.textContent !== rewritten) {
+      el.textContent = rewritten;
+      delete el.dataset.kwDmOrig;
+    }
+    // 失败：恢复原文 + 红标（隐藏模式下也不保留占位）
+    if (failTexts.has(orig) && el.textContent !== orig) {
+      el.textContent = orig;
+      delete el.dataset.kwDmOrig;
+    }    const sentAt = pendingTexts.get(orig);
+    if (hideOriginalDanmaku) {
+      if (sentAt !== undefined && el.textContent !== PENDING_PLACEHOLDER) {
+        // 隐藏模式 + 处理中：原文不外露，显示"重写中"占位
+        el.dataset.kwDmOrig = orig;
+        el.textContent = PENDING_PLACEHOLDER;
+      } else if (sentAt === undefined && el.textContent === PENDING_PLACEHOLDER) {
+        // 处理中状态过期/丢失（如桥断、结果丢失）：恢复原文，避免永久占位
+        el.textContent = orig;
+        delete el.dataset.kwDmOrig;
+      }
+    }
+    // 角标：占位文本即状态（隐藏模式处理中不打"改"标）；成功/失败/跳过始终打
+    if (
+      rewriteResults.has(orig) ||
+      failTexts.has(orig) ||
+      skipTexts.has(orig) ||
+      (!hideOriginalDanmaku && sentAt !== undefined && now - sentAt < PENDING_BADGE_TTL_MS)
+    ) {
+      syncDmBadge(el, orig);
+    }
+  }
+}
 
 function probe(root: unknown, depth: number, seen: Set<object>): DanmakuRecord[] | null {
   if (root === null || typeof root !== 'object' || depth <= 0) return null;
@@ -251,17 +404,68 @@ function startProbe(maxAttempts = 15, intervalMs = 2000): void {
 }
 
 function applyLiveRewrites(replacements: ReadonlyMap<string, string>): boolean {
-  if (!liveList || replacements.size === 0) return false;
   let changed = false;
-  for (const item of liveList) {
-    const id = String(item.idStr ?? item.id ?? '');
-    const replacement = replacements.get(id);
-    if (replacement !== undefined && item.content !== replacement) {
-      item.content = replacement;
+  // 1) 旧路径：播放器内存列表可达时（canvas 渲染的旧播放器）
+  if (liveList) {
+    for (const item of liveList) {
+      const id = String(item.idStr ?? item.id ?? '');
+      const replacement = replacements.get(id);
+      if (replacement !== undefined && item.content !== replacement) {
+        item.content = replacement;
+        changed = true;
+      }
+    }
+  }
+  // 2) DOM 路径（B 站主通道）：id → 原文 → 文本匹配替换
+  for (const [id, rewritten] of replacements) {
+    const original = idToText.get(id);
+    if (original !== undefined && original !== rewritten) {
+      rewriteResults.set(original, rewritten);
+      pendingTexts.delete(original);
+      failTexts.delete(original);
       changed = true;
     }
   }
+  if (changed) applyDmTextReplacements();
   return changed;
+}
+
+/**
+ * 批发送时标记"处理中"（原文 → 灰"改"角标）。
+ * 结果返回后由 applyLiveRewrites（成功）/ onBatchFailed（失败）清除。
+ */
+function markDmPending(items: { id: string; text: string }[]): void {
+  const now = Date.now();
+  for (const item of items) {
+    pendingTexts.set(item.text.trim(), now);
+  }
+  applyDmTextReplacements();
+}
+
+/** 批中部分/全部改写失败：保持原文，屏上打"失败"角标 */
+function markDmFailed(ids: string[], reason?: string): void {
+  let changed = false;
+  for (const id of ids) {
+    const original = idToText.get(id);
+    if (original === undefined) continue;
+    failTexts.set(original, reason ?? '改写失败，已保持原文');
+    pendingTexts.delete(original);
+    changed = true;
+  }
+  if (changed) applyDmTextReplacements();
+}
+
+/** 弹幕被跳过改写（弹幕总量超过处理上限）：保持原文，屏上打"跳过"角标 */
+function markDmSkipped(ids: string[], reason: string): void {
+  let changed = false;
+  for (const id of ids) {
+    const original = idToText.get(id);
+    if (original === undefined) continue;
+    skipTexts.set(original, reason);
+    pendingTexts.delete(original);
+    changed = true;
+  }
+  if (changed) applyDmTextReplacements();
 }
 
 // ===== adapter 装配 =====
@@ -275,9 +479,13 @@ export const bilibiliDanmakuAdapter: SiteDanmakuAdapter = {
   matchUrl: (url) => /\/x\/v2\/dm\/(?:wbi\/)?web\/seg\.so/.test(url) || /\/x\/v1\/dm\/list\.so/.test(url),
   parseResponse(data) {
     if (isXmlResponse(data)) {
-      return parseXmlDanmaku(new TextDecoder().decode(data));
+      const parsed = parseXmlDanmaku(new TextDecoder().decode(data));
+      for (const d of parsed) idToText.set(d.id, d.text);
+      return parsed;
     }
-    return extractSegElems(data).map((e) => ({ id: e.idStr, text: e.content }));
+    const elems = extractSegElems(data);
+    for (const e of elems) idToText.set(e.idStr, e.content);
+    return elems.map((e) => ({ id: e.idStr, text: e.content }));
   },
   rebuildResponse(buf, replacements) {
     if (isXmlResponse(buf)) {
@@ -287,5 +495,13 @@ export const bilibiliDanmakuAdapter: SiteDanmakuAdapter = {
     return replaceSegContent(buf, replacements);
   },
   applyLiveRewrites,
-  startLiveProbe: startProbe,
+  onBatchSent: markDmPending,
+  onBatchFailed: markDmFailed,
+  onBatchSkipped: markDmSkipped,
+  onConfigChanged: onDmConfigChanged,
+  startLiveProbe: () => {
+    // 双通道：DOM 弹幕观察（主）+ 内存列表探测（probe 回退）
+    startProbe();
+    startDmDomObserver();
+  },
 };

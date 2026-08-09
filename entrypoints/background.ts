@@ -1,11 +1,12 @@
 /**
  * Service Worker：唯一持有 API Key、唯一发起 LLM 请求的上下文。
- * 职责（docs/ARCHITECTURE.md §4）：
- *  - 按 tabId 分队列 + 全局并发调度（≤5）
+ * 职责：
+ *  - 按 tabId 分队列 + 全局并发调度（≤8，弹幕全量批管道吞吐）
  *  - 改写缓存（sha256 → 结果）
  *  - 429 指数退避（尊重 Retry-After）/ 网络重试 ≤2 / 超时熔断
- *  - 失败率熔断、401/403 停队
+ *  - 失败率熔断（暂停自动恢复）、401/403 停队（配置变更/测试连接解除）
  *  - 队列镜像持久化到 storage.local，SW 被回收后恢复
+ *  - 改写失败详情输出：SW console + KW_FAILURE_LOG 推送页面 console
  *  - KW_TEST_CONNECTION（最小 chat completion）
  */
 
@@ -19,10 +20,12 @@ import { classifyFetchError, classifyHttpStatus, extractErrorDetail } from '@/li
 import { parseRewrites } from '@/lib/response-parser';
 import type { CommentItem, RewriteReason, RuntimeMessage, StatusPayload } from '@/lib/messages';
 
-const MAX_CONCURRENCY = 5;
+const MAX_CONCURRENCY = 8;
 /** 最小请求间隔（ms）：并发之外的第二道限流，防持续密集请求触发服务商封禁 */
-const MIN_REQUEST_INTERVAL_MS = 250;
+const MIN_REQUEST_INTERVAL_MS = 200;
 const MAX_NETWORK_RETRIES = 2;
+/** parse 失败重试次数（模型偶发空响应/格式错误，重试一次成本低收益高） */
+const MAX_PARSE_RETRIES = 1;
 const MAX_CONSECUTIVE_429 = 3;
 const CIRCUIT_WINDOW = 20;
 const CIRCUIT_FAIL_RATE = 0.6;
@@ -55,6 +58,9 @@ interface Batch {
   attempts: number;
   /** 连续 429 次数（> MAX 则跳过本批并暂停） */
   consecutive429: number;
+  /** 请求元信息（fire 时填充，供失败日志定位） */
+  modelName: string;
+  baseURL: string;
 }
 
 interface MirrorState {
@@ -73,6 +79,8 @@ interface Stats {
 }
 
 const queues = new Map<number, PendingItem[]>();
+/** 每 tab 的视频弹幕总量（KW_VIDEO_META 上报；弹幕阈值判断用，无记录 = 不拦截） */
+const danmakuTotalByTab = new Map<number, number>();
 const inFlight = new Set<Batch>();
 const backoffQueue: Batch[] = [];
 const aborts = new Map<Batch, AbortController>();
@@ -104,6 +112,10 @@ export default defineBackground(() => {
       case 'KW_GET_STATUS':
         sendResponse(collectStatus());
         return false;
+      case 'KW_GET_CONFIG':
+        // main-world 劫持层拉取配置（隐藏原文等 MAIN 侧行为；经桥同步）
+        void getConfig().then((config) => sendResponse({ type: 'KW_CONFIG', config }));
+        return true;
       case 'KW_TEST_CONNECTION':
         handleTestConnection(sendResponse);
         return true;
@@ -113,6 +125,14 @@ export default defineBackground(() => {
       case 'KW_HIJACK_ACTIVE':
         // main-world 劫持脚本 → SW → 广播给 tabs（content script 之间不能直接 runtime.sendMessage）
         void broadcastToTabs(msg);
+        return false;
+      case 'KW_VIDEO_META':
+        // 视频弹幕总量（main-world 劫持 view API 提取）→ 阈值判断用
+        if (sender.tab?.id !== undefined) danmakuTotalByTab.set(sender.tab.id, msg.danmakuTotal);
+        return false;
+      case 'KW_COMMENTS_PENDING':
+        // 评论已送改写（main-world 劫持路径）→ 通知同 tab 的 isolated CS（隐藏原文占位）
+        if (sender.tab?.id !== undefined) void browser.tabs.sendMessage(sender.tab.id, msg).catch(() => {});
         return false;
       default:
         return false;
@@ -139,6 +159,21 @@ async function handleBatchRequest(requestId: string, items: CommentItem[], tabId
   if (tabId === undefined || !requestId) return;
   const valid = items.filter((it) => it?.id && typeof it.original === 'string' && it.original.trim());
   if (valid.length === 0) return;
+  // 弹幕处理上限：视频弹幕总量 > 阈值时跳过改写，整批放行原文
+  // （弹幕量极大的视频通常引战少；阈值由用户在设置中配置）
+  const config = await getConfig();
+  const max = config.danmakuMaxTotal;
+  const total = danmakuTotalByTab.get(tabId);
+  if (max !== null && total !== undefined && total > max) {
+    const results = valid.map((it) => ({ id: it.id, rewritten: it.original }));
+    void browser.tabs.sendMessage(tabId, {
+      type: 'KW_REWRITE_BATCH_RESULT',
+      requestId,
+      results,
+      skipped: true,
+    } satisfies Extract<RuntimeMessage, { type: 'KW_REWRITE_BATCH_RESULT' }>);
+    return;
+  }
   aggregates.set(requestId, { tabId, results: new Map(), remaining: valid.length });
   await enqueueItems(valid.map((it) => ({ ...it, kind: 'danmaku', requestId })), tabId);
 }
@@ -212,6 +247,8 @@ function nextBatch(config: KindlyConfig): Batch | null {
       items: queue.splice(0, config.batchSize),
       attempts: 0,
       consecutive429: 0,
+      modelName: config.modelName,
+      baseURL: config.baseURL,
     };
     if (queue.length === 0) queues.delete(tabId);
     return batch;
@@ -220,7 +257,17 @@ function nextBatch(config: KindlyConfig): Batch | null {
 }
 
 async function schedule(): Promise<void> {
-  if (authFailed || Date.now() < pausedUntil) return;
+  if (authFailed) return;
+  if (Date.now() < pausedUntil) {
+    // 熔断/限流暂停：安排恢复后自动重试，避免队列永久挂起（无新消息触发时）
+    if (!rescheduleTimer) {
+      rescheduleTimer = setTimeout(() => {
+        rescheduleTimer = null;
+        void schedule();
+      }, pausedUntil - Date.now() + 100);
+    }
+    return;
+  }
   // 最小请求间隔（借鉴 kiss-translator TaskPool 的 interval 限流）
   const wait = lastRequestStart + MIN_REQUEST_INTERVAL_MS - Date.now();
   if (wait > 0) {
@@ -241,17 +288,16 @@ async function schedule(): Promise<void> {
   }
 }
 
-/** 退避队列：到期（backoffUntil 字段由调用方在放回时记录在对象上） */
+/** 退避队列：到期（backoffUntil 字段由调用方在放回时记录在对象上）直接重发原批
+ * （保留 attempts 计数——放回队列再重建会重置 attempts，导致重试无限循环） */
 async function drainBackoff(now: number): Promise<void> {
-  for (let i = backoffQueue.length - 1; i >= 0; i--) {
+  for (let i = backoffQueue.length - 1; i >= 0 && inFlight.size < MAX_CONCURRENCY; i--) {
     const batch = backoffQueue[i];
     if (!batch) continue;
     const until = (batch as Batch & { backoffUntil?: number }).backoffUntil ?? 0;
     if (now >= until) {
       backoffQueue.splice(i, 1);
-      const queue = queues.get(batch.tabId) ?? [];
-      queue.unshift(...batch.items);
-      queues.set(batch.tabId, queue);
+      void fire(batch);
     }
   }
 }
@@ -307,12 +353,12 @@ async function fire(batch: Batch): Promise<void> {
     const data: unknown = await res.json().catch(() => null);
     const content = extractContent(data);
     if (typeof content !== 'string' || content.trim() === '') {
-      handleTransientFailure(batch, 'parse');
+      handleTransientFailure(batch, 'parse', typeof content === 'string' ? content : '（响应无文本内容）');
       return;
     }
     const rewrittenMap = parseRewrites(content, batch.items);
     if (!rewrittenMap) {
-      handleTransientFailure(batch, 'parse');
+      handleTransientFailure(batch, 'parse', content);
       return;
     }
     await handleSuccess(batch, rewrittenMap, sig);
@@ -344,9 +390,13 @@ function handleSuccess(batch: Batch, map: Map<string, string>, sig: string): Pro
 }
 
 function handleTransientFailure(batch: Batch, reason: RewriteReason, detail?: string): void {
-  if (reason === 'network' && batch.attempts < MAX_NETWORK_RETRIES) {
+  const retryable =
+    (reason === 'network' && batch.attempts < MAX_NETWORK_RETRIES) ||
+    (reason === 'parse' && batch.attempts < MAX_PARSE_RETRIES);
+  if (retryable) {
     batch.attempts++;
-    const delay = 1000 * 2 ** (batch.attempts - 1); // 1s / 2s
+    // network：1s/2s 指数退避；parse（空响应/格式错误）：立即重试
+    const delay = reason === 'parse' ? 0 : 1000 * 2 ** (batch.attempts - 1);
     (batch as Batch & { backoffUntil?: number }).backoffUntil = Date.now() + delay;
     backoffQueue.push(batch);
     return;
@@ -368,7 +418,38 @@ function handleRateLimited(batch: Batch, res: Response, detail?: string): void {
   backoffQueue.push(batch);
 }
 
+/**
+ * SW 控制台输出改写失败详情（区分评论/弹幕，面向开发者定位）：
+ *  - 原文：id + 原文完整映射（不只是文本）
+ *  - 请求返回内容：LLM 响应原文 / HTTP 错误体（截断 2000）
+ *  - 元信息：重试次数、接口、模型、时间戳
+ */
+function logRewriteFailure(batch: Batch, reason: RewriteReason, detail?: string): void {
+  const kindLabel = batch.items[0]?.kind === 'danmaku' ? '弹幕' : '评论';
+  const snippet = detail && detail.length > 2000 ? `${detail.slice(0, 2000)}…` : detail;
+  console.log(
+    `[Kindly Web] 改写失败 · ${kindLabel} · 原因: ${reason} · 重试: ${batch.attempts}次 · 时间: ${new Date().toISOString()} · 接口: ${batch.baseURL} · 模型: ${batch.modelName}`,
+    {
+      条目: batch.items.map((i) => ({ id: i.id, 原文: i.original })),
+      请求返回内容: snippet,
+    },
+  );
+  // 同步推送到页面（isolated world console 显示在页面 DevTools，用户可见）
+  void notifyTab(batch.tabId, {
+    type: 'KW_FAILURE_LOG',
+    kind: batch.items[0]?.kind === 'danmaku' ? 'danmaku' : 'comment',
+    reason,
+    ids: batch.items.map((i) => i.id),
+    originals: batch.items.map((i) => i.original),
+    attempts: batch.attempts,
+    modelName: batch.modelName,
+    baseURL: batch.baseURL,
+    detail,
+  });
+}
+
 function finishBatch(batch: Batch, reason: RewriteReason, detail?: string): void {
+  logRewriteFailure(batch, reason, detail);
   stats.failures += batch.items.length;
   stats.lastError = reason;
   if (reason === 'auth') {

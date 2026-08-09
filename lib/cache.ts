@@ -50,7 +50,7 @@ export async function sha256(text: string): Promise<string> {
 
 /**
  * 缓存签名：改写结果受内容类型（评论/弹幕 prompt 不同）、服务商、模型、
- * 强度、昵称开关影响，任一变化 → 签名变化 → 旧缓存自动失效
+ * 强度、昵称开关影响，任一变化 → 签名变化 → 缓存自动失效
  * （借鉴 kiss-translator 的 promptSig 思路）。
  */
 export function cacheSigOf(

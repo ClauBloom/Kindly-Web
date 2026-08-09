@@ -170,6 +170,20 @@ body {
   color: var(--muted);
 }
 
+.select {
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  outline: none;
+}
+.select:focus {
+  border-color: var(--primary);
+}
+
 .segmented {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

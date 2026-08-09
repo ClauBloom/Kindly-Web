@@ -4,34 +4,94 @@
  * 与站点无关：评论/弹幕的所有站点差异经由 SiteAdapter 注入
  * （URL 匹配、响应提取/重编码、屏上替换）。本引擎只负责：
  *  - 包装 window.fetch / XMLHttpRequest（document_start 注入，先于页面业务脚本）
- *  - 评论：响应零阻塞放行 + 异步提取改写
- *  - 弹幕：先放行 → 本地过滤器 → 批量改写（12s 超时兜底）→ 屏上替换 + 缓存重载替换
+ *  - 评论：响应零阻塞放行 + 异步提取改写（items 经桥 → SW）
+ *  - 弹幕：先放行 → 全量分批并发改写（DM_BATCH_SIZE/DM_MAX_INFLIGHT 管道）→
+ *    屏上替换（adapter 层 DOM 文本匹配为主）+ 缓存重载替换；超时兜底放行原文
+ *  - 视频信息（view API）劫持 → 弹幕总量上报 SW（阈值判断）
  *  - 任何异常回退原始请求行为，绝不阻塞/破坏页面
  */
 
-import { isSuspiciousDanmaku } from '@/lib/badwords';
-import { listenFromExtension, sendToExtension } from '@/lib/bridge';
+import { listenFromExtension, sendToExtension, sendToExtensionWithResponse } from '@/lib/bridge';
 import type { SiteAdapter } from '@/lib/sites/types';
 import type { CommentItem } from '@/lib/messages';
+import type { KindlyConfig } from '@/lib/config';
 
-/** 弹幕批量改写等待上限：超时直接放弃（弹幕保持原文） */
-const BATCH_TIMEOUT_MS = 12_000;
-/** 单段最多送改写的弹幕条数（防单段命中过多拖慢管道） */
-const MAX_SUSPICIOUS_PER_SEGMENT = 40;
+/** 弹幕批量改写等待上限（含 SW 排队时间）：全量并发后放宽，超时放弃（弹幕保持原文） */
+const BATCH_TIMEOUT_MS = 45_000;
+/** 弹幕每批条数（LLM 单请求容量；全量模式按此分批） */
+const DM_BATCH_SIZE = 40;
+/** 段内弹幕批并发上限（"多线程"：同时多批在飞，避免排队等结果） */
+const DM_MAX_INFLIGHT = 4;
 
 /** 改写结果缓存（id → 友善版），供弹幕段重载时直接替换 */
 const rewriteCache = new Map<string, string>();
 /** 已发送改写的 id（同段去重） */
 const pendingIds = new Set<string>();
 
+// ===== 弹幕全量批管道（段内不跳过：全部分批 + 并发处理） =====
+/** 段内排队中的弹幕批 */
+let dmQueuedBatches: { id: string; text: string }[][] = [];
+/** 段内在飞的批数 */
+let dmInflight = 0;
+
+/** 全量弹幕分批入队（按 DM_BATCH_SIZE 切批；pendingIds 已过滤） */
+function queueDanmakuBatches(elems: { id: string; text: string }[]): void {
+  for (let i = 0; i < elems.length; i += DM_BATCH_SIZE) {
+    dmQueuedBatches.push(elems.slice(i, i + DM_BATCH_SIZE));
+  }
+  pumpDanmakuBatches();
+}
+
+/** 管道泵：在飞批数不足时补发下一批（并发 = "多线程"语义） */
+function pumpDanmakuBatches(): void {
+  while (dmInflight < DM_MAX_INFLIGHT && dmQueuedBatches.length > 0) {
+    const batch = dmQueuedBatches.shift();
+    if (!batch) break;
+    dmInflight++;
+    void rewriteDanmakuWithText(batch).finally(() => {
+      dmInflight--;
+      pumpDanmakuBatches();
+    });
+  }
+}
+
 export function startHijack(adapter: SiteAdapter): void {
   adapterDanmaku = adapter.danmaku ?? null;
   adapter.danmaku?.startLiveProbe?.();
   // 注册桥广播监听：处理 isolated 侧的 __bridge_ready 握手（此后 sendToExtension 才直发）。
   // 必须在 startHijack 立即注册，否则评论路径的 sendToExtension 会一直排队（bridgeReady 永不为 true）。
-  listenFromExtension(() => {});
+  listenFromExtension((msg) => {
+    const m = msg as { type?: string };
+    // SW 广播配置变更 → 重拉配置（隐藏原文等 MAIN 侧行为）
+    if (m?.type === 'KW_CONFIG_CHANGED') void syncMainConfig();
+  });
+  // 拉取初始配置（桥就绪后 sendToExtensionWithResponse 会排队补发）
+  void syncMainConfig();
   hijackFetch(adapter);
   hijackXhr(adapter);
+}
+
+/** MAIN world 侧配置（隔离层经桥同步；供隐藏原文等屏上行为判断） */
+let mainConfig: Pick<KindlyConfig, 'hideOriginalComment' | 'hideOriginalDanmaku'> | null = null;
+
+export function shouldHideOriginal(kind: 'comment' | 'danmaku'): boolean {
+  return kind === 'danmaku' ? (mainConfig?.hideOriginalDanmaku ?? false) : (mainConfig?.hideOriginalComment ?? false);
+}
+
+async function syncMainConfig(): Promise<void> {
+  try {
+    const res = await sendToExtensionWithResponse<{ type: 'KW_CONFIG'; config: KindlyConfig }>({ type: 'KW_GET_CONFIG' });
+    if (res?.type === 'KW_CONFIG' && res.config) {
+      mainConfig = {
+        hideOriginalComment: res.config.hideOriginalComment,
+        hideOriginalDanmaku: res.config.hideOriginalDanmaku,
+      };
+      // 配置变化后重新同步屏上弹幕占位状态（隐藏开启时把已加载原文替换为占位）
+      adapterDanmaku?.onConfigChanged?.(mainConfig.hideOriginalDanmaku);
+    }
+  } catch {
+    // 桥未就绪/失败：保持上次配置
+  }
 }
 
 // ===== fetch 劫持 =====
@@ -43,6 +103,18 @@ function hijackFetch(adapter: SiteAdapter): void {
     try {
       if (adapter.matchReplyUrl(url)) return await handleReplyFetch(origFetch, input, init, adapter);
       if (adapter.danmaku?.matchUrl(url)) return await handleDanmakuFetch(origFetch, input, init, adapter);
+      if (adapter.videoMeta?.matchUrl(url)) {
+        const res = await origFetch(input, init);
+        void res
+          .clone()
+          .json()
+          .then((data: unknown) => {
+            const total = adapter.videoMeta!.extractDanmakuTotal(data);
+            if (total !== null) sendToExtension({ type: 'KW_VIDEO_META', danmakuTotal: total });
+          })
+          .catch(() => {});
+        return res;
+      }
     } catch {
       // 劫持处理异常绝不影响页面请求：回退原始行为
     }
@@ -66,6 +138,8 @@ async function handleReplyFetch(
       if (items.length > 0) {
         notifyHijackActive();
         sendToExtension({ type: 'KW_REWRITE_COMMENTS', items });
+        // 通知 isolated：这批评论已送改写（隐藏原文模式在渲染后显示"重写中"占位）
+        sendToExtension({ type: 'KW_COMMENTS_PENDING', items: items.map((i) => ({ id: i.id, seq: i.seq })) });
       }
     })
     .catch(() => {});
@@ -95,12 +169,11 @@ async function handleDanmakuFetch(
     const hit = rewriteCache.get(e.id);
     if (hit !== undefined && hit !== e.text) cachedReplacements.set(e.id, hit);
   }
-  // 新可疑弹幕 → 异步改写（不阻塞本次响应）
-  const suspicious = elems
-    .filter((e) => !pendingIds.has(e.id) && isSuspiciousDanmaku(e.text))
-    .slice(0, MAX_SUSPICIOUS_PER_SEGMENT);
-  if (suspicious.length > 0) {
-    void rewriteDanmakuWithText(suspicious);
+  // 弹幕全量送改写（阴阳怪气交由 LLM 判断；同段按 id 去重）：
+  // 全量分批 + 并发管道（DM_MAX_INFLIGHT 批在飞），不设单段条数上限
+  const fresh = elems.filter((e) => !pendingIds.has(e.id));
+  if (fresh.length > 0) {
+    queueDanmakuBatches(fresh);
   }
   if (cachedReplacements.size > 0) {
     const modified = danmaku.rebuildResponse(buf, cachedReplacements);
@@ -137,6 +210,7 @@ function hijackXhr(adapter: SiteAdapter): void {
           if (items.length > 0) {
             notifyHijackActive();
             sendToExtension({ type: 'KW_REWRITE_COMMENTS', items });
+            sendToExtension({ type: 'KW_COMMENTS_PENDING', items: items.map((i) => ({ id: i.id, seq: i.seq })) });
           }
         } catch {
           // 非 JSON 响应，忽略
@@ -155,10 +229,9 @@ function hijackXhr(adapter: SiteAdapter): void {
           return;
         }
         const elems = adapter.danmaku!.parseResponse(data);
-        const suspicious = elems
-          .filter((e) => !pendingIds.has(e.id) && isSuspiciousDanmaku(e.text))
-          .slice(0, MAX_SUSPICIOUS_PER_SEGMENT);
-        if (suspicious.length > 0) void rewriteDanmakuWithText(suspicious);
+        // 弹幕全量送改写（分批并发，不设单段条数上限）
+        const fresh = elems.filter((e) => !pendingIds.has(e.id));
+        if (fresh.length > 0) queueDanmakuBatches(fresh);
       });
     }
   };
@@ -168,6 +241,8 @@ function hijackXhr(adapter: SiteAdapter): void {
 
 async function rewriteDanmakuWithText(entries: { id: string; text: string }[]): Promise<void> {
   for (const e of entries) pendingIds.add(e.id);
+  // 屏上标记"处理中"（adapter 层按原文打灰"改"角标）
+  adapterDanmaku?.onBatchSent?.(entries);
   const items: CommentItem[] = entries.map((e) => ({
     id: e.id,
     author: '',
@@ -176,25 +251,56 @@ async function rewriteDanmakuWithText(entries: { id: string; text: string }[]): 
     kind: 'danmaku',
   }));
   const requestId = crypto.randomUUID();
-  const results = await sendBatch(requestId, items);
-  if (!results) return;
+  const res = await sendBatch(requestId, items);
+  if (!res) {
+    // 超时兜底：整批失败（保持原文），屏上标记"失败" + 页面 console 日志
+    console.log(`[Kindly Web] 改写失败 · 弹幕 · 原因: timeout`, {
+      时间: new Date().toISOString(),
+      条目: entries.map((e) => ({ id: e.id, 原文: e.text })),
+      说明: '45s 内未收到改写结果（SW 队列拥塞或网络异常）',
+    });
+    adapterDanmaku?.onBatchFailed?.(
+      entries.map((e) => e.id),
+      '改写超时，已保持原文',
+    );
+    return;
+  }
+  if (res.skipped) {
+    // 阈值跳过（弹幕总量超过上限）：非失败，保持原文并打"跳过"标识
+    adapterDanmaku?.onBatchSkipped?.(
+      entries.map((e) => e.id),
+      '弹幕总量超过处理上限，已跳过改写',
+    );
+    return;
+  }
   const replacements = new Map<string, string>();
-  for (const r of results) {
+  const failedIds: string[] = [];
+  for (const r of res.results) {
     if (r.rewritten !== '') {
       replacements.set(r.id, r.rewritten);
       rewriteCache.set(r.id, r.rewritten);
+    } else {
+      failedIds.push(r.id);
     }
   }
+  if (failedIds.length > 0) {
+    adapterDanmaku?.onBatchFailed?.(failedIds, '改写失败，已保持原文');
+  }
   if (replacements.size > 0) {
-    // 屏上替换（尽力而为）：播放器内存列表 → canvas 下一帧重绘
+    // 屏上替换：adapter 层按原文文本匹配替换已渲染弹幕（DOM 元素为主，内存列表回退）
     adapterDanmaku?.applyLiveRewrites?.(replacements);
   }
 }
 
-function sendBatch(requestId: string, items: CommentItem[]): Promise<{ id: string; rewritten: string }[] | null> {
-  const { promise, resolve } = Promise.withResolvers<{ id: string; rewritten: string }[] | null>();
+interface BatchOutcome {
+  results: { id: string; rewritten: string }[];
+  skipped?: boolean;
+}
+
+function sendBatch(requestId: string, items: CommentItem[]): Promise<BatchOutcome | null> {
+  const { promise, resolve } = Promise.withResolvers<BatchOutcome | null>();
   let settled = false;
-  const finish = (value: { id: string; rewritten: string }[] | null) => {
+  const finish = (value: BatchOutcome | null) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
@@ -203,9 +309,14 @@ function sendBatch(requestId: string, items: CommentItem[]): Promise<{ id: strin
   };
   const timer = setTimeout(() => finish(null), BATCH_TIMEOUT_MS);
   const unsubscribe = listenFromExtension((msg) => {
-    const m = msg as { type?: string; requestId?: string; results?: { id: string; rewritten: string }[] };
+    const m = msg as {
+      type?: string;
+      requestId?: string;
+      results?: { id: string; rewritten: string }[];
+      skipped?: boolean;
+    };
     if (m?.type === 'KW_REWRITE_BATCH_RESULT' && m.requestId === requestId) {
-      finish(m.results ?? []);
+      finish({ results: m.results ?? [], skipped: m.skipped });
     }
   });
   sendToExtension({ type: 'KW_REWRITE_BATCH', requestId, kind: 'danmaku', items });

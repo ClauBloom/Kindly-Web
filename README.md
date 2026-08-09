@@ -45,7 +45,7 @@ pnpm build          # 构建产物输出到 .output/chrome-mv3
 
 ## 技术架构
 
-详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：MV3 安全模型（API 调用收敛在 Service Worker）、消息协议、队列调度、缓存与错误降级策略。
+架构设计记录在仓库根目录的 [AGENTS.md](AGENTS.md)：MV3 安全模型（API 调用收敛在 Service Worker）、消息协议、队列调度、缓存与错误降级策略。
 
 **多平台可扩展**：站点差异全部收敛在 `lib/sites/` 适配器（评论接口/DOM 选择器/弹幕格式），通用引擎与 Service Worker 零站点耦合——接入抖音等新平台只需新增一个适配器文件 + 注册表一行 + 薄壳入口脚本（流程见 [AGENTS.md](AGENTS.md)）。
 

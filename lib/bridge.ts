@@ -21,18 +21,18 @@ import { browser } from 'wxt/browser';
 /** 桥就绪标志（isolated 侧 startBridge 后发 ready 握手） */
 let bridgeReady = false;
 /** 桥未就绪期间的消息队列（页面脚本先于 isolated CS 执行时会丢失消息） */
-const pendingQueue: unknown[] = [];
+const pendingQueue: { id: string; wantResponse: boolean; msg: unknown }[] = [];
 
 /** 发送消息给扩展（fire-and-forget，无响应；桥未就绪时排队，就绪后补发） */
 export function sendToExtension(msg: unknown): void {
   if (!bridgeReady) {
-    pendingQueue.push(msg);
+    pendingQueue.push({ id: '', wantResponse: false, msg });
     return;
   }
   window.postMessage({ [MARK]: true, kind: 'to-ext', wantResponse: false, id: '', msg }, '*');
 }
 
-/** 发送消息并等待扩展同步响应（popup 式 sendResponse） */
+/** 发送消息并等待扩展同步响应（popup 式 sendResponse；桥未就绪时同样排队补发） */
 export function sendToExtensionWithResponse<T = unknown>(msg: unknown): Promise<T> {
   return new Promise<T>((resolve) => {
     const id = crypto.randomUUID();
@@ -44,6 +44,10 @@ export function sendToExtensionWithResponse<T = unknown>(msg: unknown): Promise<
       }
     };
     window.addEventListener('message', handler);
+    if (!bridgeReady) {
+      pendingQueue.push({ id, wantResponse: true, msg });
+      return;
+    }
     window.postMessage({ [MARK]: true, kind: 'to-ext', wantResponse: true, id, msg }, '*');
   });
 }
@@ -57,8 +61,11 @@ export function listenFromExtension(listener: (msg: unknown) => void): () => voi
       // isolated 桥就绪握手：补发排队消息
       if (!bridgeReady) {
         bridgeReady = true;
-        for (const msg of pendingQueue.splice(0)) {
-          window.postMessage({ [MARK]: true, kind: 'to-ext', wantResponse: false, id: '', msg }, '*');
+        for (const pending of pendingQueue.splice(0)) {
+          window.postMessage(
+            { [MARK]: true, kind: 'to-ext', wantResponse: pending.wantResponse, id: pending.id, msg: pending.msg },
+            '*',
+          );
         }
       }
       return;

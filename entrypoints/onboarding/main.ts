@@ -1,5 +1,5 @@
 /**
- * 初次引导 5 步向导（docs/ARCHITECTURE.md §5.2）。
+ * 初次引导 5 步向导。
  * 规则：每步可跳过（跳过不写 onboardingDone，popup 持续显示 CTA）；
  * 自定义 baseURL 在本步内触发权限申请（用户手势窗口内）。
  */
@@ -277,7 +277,12 @@ async function runTest(): Promise<void> {
 
 function savePrefs(): void {
   const checked = Array.from(document.querySelectorAll<HTMLInputElement>('#site-list input[type="checkbox"]:checked'));
-  void saveConfig({ enabledSites: checked.map((c) => c.dataset.siteKey ?? '').filter(Boolean) });
+  // 第 4 步是向导最后一步表单：走到第 5 步（完成页）即视为引导完成。
+  // 不写的话 onboardingDone 永远为 false，popup 会一直显示"开始配置"（死循环）
+  void saveConfig({
+    enabledSites: checked.map((c) => c.dataset.siteKey ?? '').filter(Boolean),
+    onboardingDone: true,
+  });
 }
 
 function go(target: number): void {

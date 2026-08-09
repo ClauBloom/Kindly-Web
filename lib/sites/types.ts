@@ -22,12 +22,23 @@ export interface SiteDanmakuAdapter {
    */
   rebuildResponse(buf: Uint8Array, replacements: ReadonlyMap<string, string>): Uint8Array | null;
   /**
-   * 屏上替换（渐进增强）：改写结果应用到播放器内存弹幕列表，
-   * 使 canvas 下一帧重绘友善版。返回 false = 未能定位播放器列表（降级）。
+   * 屏上替换：改写结果应用到已渲染弹幕（DOM 元素按原文文本匹配替换为主，
+   * 播放器内存列表为回退）。返回 false = 未能定位（降级为缓存重载替换）。
    */
   applyLiveRewrites?(replacements: ReadonlyMap<string, string>): boolean;
   /** 启动屏上替换探测（播放器初始化可能需要时间，内部自定重试策略） */
   startLiveProbe?(): void;
+  /** 弹幕批已发送改写（屏上标记"处理中"；items 含 id/text） */
+  onBatchSent?(items: { id: string; text: string }[]): void;
+  /** 弹幕批中部分/全部改写失败（保持原文；屏上标记"失败"） */
+  onBatchFailed?(ids: string[], reason?: string): void;
+  /** 弹幕被跳过改写（视频弹幕总量超过处理上限；保持原文，屏上标记"跳过"） */
+  onBatchSkipped?(ids: string[], reason: string): void;
+  /**
+   * 配置变化（MAIN 侧 config 同步后回调；hideOriginal 传入最新值）。
+   * 适配器借此重新同步屏上占位状态（隐藏原文开启时把已加载原文替换为"重写中"）。
+   */
+  onConfigChanged?(hideOriginalDanmaku: boolean): void;
 }
 
 export interface SiteCommentSelectors {
@@ -37,6 +48,13 @@ export interface SiteCommentSelectors {
   content: string;
   /** 评论者昵称选择器 */
   author: string;
+}
+
+export interface SiteVideoMeta {
+  /** 视频信息接口 URL 匹配（如 B 站 /x/web-interface/view；main world 劫持层） */
+  matchUrl(url: string): boolean;
+  /** 从响应提取弹幕总量（stat.danmaku 等）；拿不到返回 null */
+  extractDanmakuTotal(data: unknown): number | null;
 }
 
 export interface SiteAdapter {
@@ -52,7 +70,7 @@ export interface SiteAdapter {
   extractReplies(data: unknown, url: string): CommentItem[];
   /**
    * 按 id（rpid 等）定位评论 DOM 节点（isolated world，结果应用）。
-   * seq = 接口响应索引（B 站新版评论区 DOM 无 rpid 属性，只能按顺序定位）。
+   * seq = 接口响应索引（B 站评论区 DOM 无 rpid 属性，只能按顺序定位）。
    */
   resolveCommentRoot(id: string, seq?: number): HTMLElement | null;
   /**
@@ -64,4 +82,6 @@ export interface SiteAdapter {
   commentSelectors: SiteCommentSelectors;
   /** 弹幕能力（站点无弹幕则不提供） */
   danmaku?: SiteDanmakuAdapter;
+  /** 视频信息能力（弹幕阈值判断需要弹幕总量；站点无则跳过） */
+  videoMeta?: SiteVideoMeta;
 }

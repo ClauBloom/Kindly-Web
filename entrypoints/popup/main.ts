@@ -1,5 +1,5 @@
 import { browser } from 'wxt/browser';
-import { getApiKey, getConfig, saveConfig } from '@/lib/config';
+import { DANMAKU_MAX_OPTIONS, getApiKey, getConfig, saveConfig } from '@/lib/config';
 import type { Intensity, KindlyConfig } from '@/lib/config';
 import { t } from '@/lib/i18n';
 import type { StatusPayload } from '@/lib/messages';
@@ -22,6 +22,7 @@ async function main(): Promise<void> {
   $('btn-settings').textContent = t('popup.openSettings');
   $('btn-visit').textContent = t('popup.visitBilibili');
   $('intensity-label').textContent = t('popup.intensity');
+  $('danmaku-max-label').textContent = t('popup.danmakuMaxTotal');
   $('st-queue-label').textContent = t('popup.status.queue');
   $('st-inflight-label').textContent = t('popup.status.inflight');
   $('st-failures-label').textContent = t('popup.status.failures');
@@ -47,6 +48,23 @@ function render(config: KindlyConfig, hasKey: boolean): void {
   (document.getElementById('toggle') as HTMLInputElement).checked = config.enabled;
   $('toggle-label').textContent = config.enabled ? t('popup.toggle.on') : t('popup.toggle.off');
   buildIntensity(config.intensity);
+  buildDanmakuMaxTotalSelect(config.danmakuMaxTotal);
+}
+
+function buildDanmakuMaxTotalSelect(current: number | null): void {
+  const select = document.getElementById('danmaku-max') as HTMLSelectElement;
+  select.innerHTML = '';
+  for (const opt of DANMAKU_MAX_OPTIONS) {
+    const el = document.createElement('option');
+    el.value = opt.value === null ? '' : String(opt.value);
+    el.textContent = opt.label;
+    select.appendChild(el);
+  }
+  select.value = current === null ? '' : String(current);
+  select.addEventListener('change', () => {
+    const raw = select.value;
+    void saveConfig({ danmakuMaxTotal: raw === '' ? null : Number(raw) });
+  });
 }
 
 function buildIntensity(current: Intensity): void {
@@ -103,7 +121,8 @@ function bindEvents(config: KindlyConfig): void {
     window.close();
   });
   $('btn-settings').addEventListener('click', () => {
-    void browser.runtime.openOptionsPage();
+    // 打开设置 = 选项页（options.html）；不用 openOptionsPage，显式 URL 更直接
+    void browser.tabs.create({ url: browser.runtime.getURL('/options.html') });
     window.close();
   });
   $('btn-visit').addEventListener('click', () => {
