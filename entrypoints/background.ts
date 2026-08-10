@@ -14,7 +14,7 @@ import { defineBackground } from 'wxt/utils/define-background';
 import { browser } from 'wxt/browser';
 import { getApiKeys, getConfig, saveConfig } from '@/lib/config';
 import type { KindlyConfig } from '@/lib/config';
-import { buildMessages } from '@/lib/prompt';
+import { buildMessages, resolveStyleInstruction } from '@/lib/prompt';
 import { cacheGet, cacheSet, cacheSigOf } from '@/lib/cache';
 import { classifyFetchError, classifyHttpStatus, extractErrorDetail } from '@/lib/errors';
 import { parseRewrites } from '@/lib/response-parser';
@@ -27,9 +27,11 @@ import type { CommentItem, RewriteReason, RuntimeMessage, StatusPayload } from '
 let maxConcurrency = 16;
 /** 最小请求间隔（ms）：并发之外的第二道限流，防持续密集请求触发服务商封禁 */
 const MIN_REQUEST_INTERVAL_MS = 50;
-const MAX_NETWORK_RETRIES = 2;
-/** parse 失败重试次数（模型偶发空响应/格式错误，重试一次成本低收益高） */
-const MAX_PARSE_RETRIES = 1;
+/** 瞬时失败（网络/解析）重试次数与基础间隔（ms）：由配置驱动，schedule 每次读配置更新 */
+let retryCount = 2;
+let retryIntervalMs = 1000;
+/** parse 失败立即重试（模型偶发空响应/格式错误，无需等待） */
+const PARSE_RETRY_DELAY_MS = 0;
 const MAX_CONSECUTIVE_429 = 3;
 const CIRCUIT_WINDOW = 20;
 const CIRCUIT_FAIL_RATE = 0.6;
@@ -46,6 +48,8 @@ interface PendingItem {
   requestId?: string;
   /** 评论接口响应顺序索引（结果应用按 seq 定位 DOM） */
   seq?: number;
+  /** 评论渲染树定位路径（楼中楼 [顶层 seq, 子索引]；顶层与 seq 等价） */
+  path?: number[];
 }
 
 /** 弹幕批量聚合状态：全部条目完成（成功或失败）后一次性回发 */
@@ -190,7 +194,14 @@ async function enqueueItems(items: CommentItem[], tabId: number): Promise<void> 
   const fresh: PendingItem[] = [];
   for (const item of items) {
     const kind = item.kind ?? 'comment';
-    const sig = cacheSigOf(config.baseURL, config.modelName, config.intensity, config.includeAuthor, kind);
+    const sig = cacheSigOf(
+      config.baseURL,
+      config.modelName,
+      config.intensity,
+      config.includeAuthor,
+      kind,
+      resolveStyleInstruction(config),
+    );
     const cached = await cacheGet(item.original, sig);
     if (cached !== null) {
       stats.totalRewritten++;
@@ -204,6 +215,7 @@ async function enqueueItems(items: CommentItem[], tabId: number): Promise<void> 
       kind,
       requestId: item.requestId,
       seq: item.seq,
+      path: item.path,
     });
   }
   if (fresh.length === 0) return;
@@ -233,7 +245,14 @@ function deliverResult(tabId: number, item: PendingItem | CommentItem, rewritten
     }
     return;
   }
-  void notifyTab(tabId, { type: 'KW_REWRITE_RESULT', id: item.id, rewritten, seq: item.seq });
+  void notifyTab(tabId, {
+    type: 'KW_REWRITE_RESULT',
+    id: item.id,
+    rewritten,
+    seq: item.seq,
+    path: item.path,
+    original: item.original,
+  });
 }
 
 function nextBatch(config: KindlyConfig): Batch | null {
@@ -285,6 +304,8 @@ async function schedule(): Promise<void> {
   }
   const config = await getConfig();
   maxConcurrency = Math.min(128, Math.max(1, config.dmConcurrency));
+  retryCount = Math.min(5, Math.max(0, config.retryCount));
+  retryIntervalMs = Math.min(30_000, Math.max(0, config.retryIntervalSec * 1000));
   void drainBackoff(Date.now());
   while (inFlight.size < maxConcurrency) {
     const batch = nextBatch(config);
@@ -327,7 +348,14 @@ async function fire(batch: Batch): Promise<void> {
 
   lastRequestStart = Date.now();
   const kind = batch.items[0]?.kind ?? 'comment';
-  const sig = cacheSigOf(config.baseURL, config.modelName, config.intensity, config.includeAuthor, kind);
+  const sig = cacheSigOf(
+    config.baseURL,
+    config.modelName,
+    config.intensity,
+    config.includeAuthor,
+    kind,
+    resolveStyleInstruction(config),
+  );
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
   try {
     const res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/chat/completions`, {
@@ -395,13 +423,11 @@ function handleSuccess(batch: Batch, map: Map<string, string>, sig: string): Pro
 }
 
 function handleTransientFailure(batch: Batch, reason: RewriteReason, detail?: string): void {
-  const retryable =
-    (reason === 'network' && batch.attempts < MAX_NETWORK_RETRIES) ||
-    (reason === 'parse' && batch.attempts < MAX_PARSE_RETRIES);
+  const retryable = (reason === 'network' || reason === 'parse') && batch.attempts < retryCount;
   if (retryable) {
     batch.attempts++;
-    // network：1s/2s 指数退避；parse（空响应/格式错误）：立即重试
-    const delay = reason === 'parse' ? 0 : 1000 * 2 ** (batch.attempts - 1);
+    // network：retryInterval × 2^(次数-1) 指数退避（默认 1s/2s）；parse（空响应/格式错误）：立即重试
+    const delay = reason === 'parse' ? PARSE_RETRY_DELAY_MS : retryIntervalMs * 2 ** (batch.attempts - 1);
     (batch as Batch & { backoffUntil?: number }).backoffUntil = Date.now() + delay;
     backoffQueue.push(batch);
     return;
@@ -463,7 +489,15 @@ function finishBatch(batch: Batch, reason: RewriteReason, detail?: string): void
     for (const [tabId, queue] of queues) {
       for (const item of queue) {
         if (item.requestId) deliverResult(tabId, item, item.original);
-        else void notifyTab(tabId, { type: 'KW_REWRITE_ERROR', id: item.id, reason: 'auth', detail, seq: item.seq });
+        else
+          void notifyTab(tabId, {
+            type: 'KW_REWRITE_ERROR',
+            id: item.id,
+            reason: 'auth',
+            detail,
+            seq: item.seq,
+            path: item.path,
+          });
       }
       queues.delete(tabId);
     }
@@ -471,7 +505,15 @@ function finishBatch(batch: Batch, reason: RewriteReason, detail?: string): void
   for (const item of batch.items) {
     // 弹幕改写失败 → 保持原文（聚合回发）；评论 → 逐条错误消息
     if (item.requestId) deliverResult(batch.tabId, item, item.original);
-    else void notifyTab(batch.tabId, { type: 'KW_REWRITE_ERROR', id: item.id, reason, detail, seq: item.seq });
+    else
+      void notifyTab(batch.tabId, {
+        type: 'KW_REWRITE_ERROR',
+        id: item.id,
+        reason,
+        detail,
+        seq: item.seq,
+        path: item.path,
+      });
   }
   recordOutcome(0);
   broadcastStatus();

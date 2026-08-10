@@ -16,6 +16,7 @@
  */
 
 import type { SiteDanmakuAdapter } from './types.ts';
+import { normalizeCommentText } from './bilibili.ts';
 
 // ===== protobuf 通用编解码（wire format 与站点无关，但当前仅 B 站使用）=====
 
@@ -201,26 +202,82 @@ let probing = false;
  */
 let dmObserver: MutationObserver | null = null;
 let dmContainer: HTMLElement | null = null;
-/** id → 原文（parseResponse 时积累，applyLiveRewrites 借它做文本匹配） */
+/** id → 原文（parseResponse 时积累，applyLiveRewrites 借它做结果映射） */
 const idToText = new Map<string, string>();
-/** 原文 → 改写文本（弹幕 DOM 元素无 id，按文本匹配） */
+/**
+ * 以下各 Map 的 key 统一为规范化原文（normalizeCommentText：去 [表情] 标记 + 压缩空白）。
+ * 弹幕 DOM 元素无 id，按文本匹配；DOM 渲染后表情变图片、textContent 缺标记，
+ * 必须规范化后才能与接口原文对上。
+ */
+/** 规范化原文 → 改写文本（弹幕 DOM 元素无 id，按文本匹配） */
 const rewriteResults = new Map<string, string>();
-/** 原文 → 发送时间戳（处理中；超时自动降级不显示角标） */
+/** 规范化原文 → 发送时间戳（处理中；超时自动降级不显示角标） */
 const pendingTexts = new Map<string, number>();
-/** 原文 → 失败原因（改写失败保持原文，屏上打"失败"角标） */
+/** 规范化原文 → 失败原因（改写失败保持原文，屏上打"失败"角标） */
 const failTexts = new Map<string, string>();
-/** 原文 → 跳过原因（弹幕总量超过处理上限时整批跳过，屏上打"跳过"角标） */
+/** 规范化原文 → 跳过原因（弹幕总量超过处理上限时整批跳过，屏上打"跳过"角标） */
 const skipTexts = new Map<string, string>();
 
 /** 改写前隐藏原文（弹幕）：屏上显示"重写中"占位，改写完成后替换（经桥从 SW 同步） */
 let hideOriginalDanmaku = false;
 /** 占位文本（隐藏模式 + 处理中） */
 const PENDING_PLACEHOLDER = '重写中';
+/** 占位弹幕"划过中线"检查间隔（弹幕全屏滚动约 4–6s，250ms 精度足够） */
+const DM_MIDLINE_CHECK_MS = 250;
 
 /** 配置变化（hijack-engine 经桥同步后回调）：更新隐藏标志并重扫屏上占位 */
 function onDmConfigChanged(hide: boolean): void {
   hideOriginalDanmaku = hide;
+  if (!hide) stopDmMidlineReveal();
   applyDmTextReplacements();
+}
+
+/**
+ * 判定弹幕是否已划过播放器中线：右边缘越过中线（整条弹幕已进入左半屏）。
+ * 纯函数，便于单元测试。
+ */
+export function dmCrossedMidline(elRight: number, containerLeft: number, containerWidth: number): boolean {
+  return elRight <= containerLeft + containerWidth / 2;
+}
+
+/**
+ * 隐藏原文模式下的"过中线恢复"：
+ * 弹幕划过播放器中线仍未改写完成 → 占位对用户无意义（即将出画），
+ * 自动恢复原文（结果若在屏期间返回，正常替换逻辑仍会生效）。
+ * 仅在存在占位元素时轮询，无占位即自停。
+ */
+let dmRevealTimer: number | null = null;
+
+function startDmMidlineReveal(): void {
+  if (dmRevealTimer || !hideOriginalDanmaku) return;
+  dmRevealTimer = setInterval(checkDmMidlineReveal, DM_MIDLINE_CHECK_MS);
+}
+
+function stopDmMidlineReveal(): void {
+  if (dmRevealTimer) {
+    clearInterval(dmRevealTimer);
+    dmRevealTimer = null;
+  }
+}
+
+function checkDmMidlineReveal(): void {
+  if (!dmContainer || !hideOriginalDanmaku) return;
+  const els = dmContainer.querySelectorAll<HTMLElement>('.bili-danmaku-x-dm[data-kw-dm-orig]');
+  if (els.length === 0) {
+    stopDmMidlineReveal();
+    return;
+  }
+  const containerRect = dmContainer.getBoundingClientRect();
+  for (const el of els) {
+    const orig = el.dataset.kwDmOrig ?? '';
+    if (orig === '') continue;
+    if (dmCrossedMidline(el.getBoundingClientRect().right, containerRect.left, containerRect.width)) {
+      // 已过中线仍未改写：恢复原文并退出处理中（结果返回后 applyDmTextReplacements 会正常替换）
+      el.textContent = orig;
+      delete el.dataset.kwDmOrig;
+      pendingTexts.delete(normalizeCommentText(orig));
+    }
+  }
 }
 
 /** 处理中角标超时（毫秒）：超过后不再显示"改"标（结果可能已丢，避免永久悬空） */
@@ -308,38 +365,41 @@ function applyDmTextReplacements(): void {
   const now = Date.now();
   const els = dmContainer.querySelectorAll<HTMLElement>('.bili-danmaku-x-dm');
   for (const el of els) {
-    // 占位元素用 dataset 记录原文；普通元素用当前文本
-    const orig = el.dataset.kwDmOrig ?? el.textContent?.trim() ?? '';
-    if (orig === '') continue;
-    const rewritten = rewriteResults.get(orig);
+    // 占位元素用 dataset 记录原文；普通元素用当前文本（均规范化后作为 Map key）
+    const raw = el.dataset.kwDmOrig ?? el.textContent?.trim() ?? '';
+    if (raw === '') continue;
+    const key = normalizeCommentText(raw);
+    const rewritten = rewriteResults.get(key);
     if (rewritten !== undefined && el.textContent !== rewritten) {
       el.textContent = rewritten;
       delete el.dataset.kwDmOrig;
     }
     // 失败：恢复原文 + 红标（隐藏模式下也不保留占位）
-    if (failTexts.has(orig) && el.textContent !== orig) {
-      el.textContent = orig;
+    if (failTexts.has(key) && el.textContent !== raw) {
+      el.textContent = raw;
       delete el.dataset.kwDmOrig;
-    }    const sentAt = pendingTexts.get(orig);
+    }
+    const sentAt = pendingTexts.get(key);
     if (hideOriginalDanmaku) {
       if (sentAt !== undefined && el.textContent !== PENDING_PLACEHOLDER) {
         // 隐藏模式 + 处理中：原文不外露，显示"重写中"占位
-        el.dataset.kwDmOrig = orig;
+        el.dataset.kwDmOrig = raw;
         el.textContent = PENDING_PLACEHOLDER;
+        startDmMidlineReveal();
       } else if (sentAt === undefined && el.textContent === PENDING_PLACEHOLDER) {
         // 处理中状态过期/丢失（如桥断、结果丢失）：恢复原文，避免永久占位
-        el.textContent = orig;
+        el.textContent = raw;
         delete el.dataset.kwDmOrig;
       }
     }
     // 角标：占位文本即状态（隐藏模式处理中不打"改"标）；成功/失败/跳过始终打
     if (
-      rewriteResults.has(orig) ||
-      failTexts.has(orig) ||
-      skipTexts.has(orig) ||
+      rewriteResults.has(key) ||
+      failTexts.has(key) ||
+      skipTexts.has(key) ||
       (!hideOriginalDanmaku && sentAt !== undefined && now - sentAt < PENDING_BADGE_TTL_MS)
     ) {
-      syncDmBadge(el, orig);
+      syncDmBadge(el, key);
     }
   }
 }
@@ -416,13 +476,14 @@ function applyLiveRewrites(replacements: ReadonlyMap<string, string>): boolean {
       }
     }
   }
-  // 2) DOM 路径（B 站主通道）：id → 原文 → 文本匹配替换
+  // 2) DOM 路径（B 站主通道）：id → 原文 → 规范化 → 文本匹配替换
   for (const [id, rewritten] of replacements) {
     const original = idToText.get(id);
     if (original !== undefined && original !== rewritten) {
-      rewriteResults.set(original, rewritten);
-      pendingTexts.delete(original);
-      failTexts.delete(original);
+      const key = normalizeCommentText(original);
+      rewriteResults.set(key, rewritten);
+      pendingTexts.delete(key);
+      failTexts.delete(key);
       changed = true;
     }
   }
@@ -437,7 +498,7 @@ function applyLiveRewrites(replacements: ReadonlyMap<string, string>): boolean {
 function markDmPending(items: { id: string; text: string }[]): void {
   const now = Date.now();
   for (const item of items) {
-    pendingTexts.set(item.text.trim(), now);
+    pendingTexts.set(normalizeCommentText(item.text), now);
   }
   applyDmTextReplacements();
 }
@@ -448,8 +509,9 @@ function markDmFailed(ids: string[], reason?: string): void {
   for (const id of ids) {
     const original = idToText.get(id);
     if (original === undefined) continue;
-    failTexts.set(original, reason ?? '改写失败，已保持原文');
-    pendingTexts.delete(original);
+    const key = normalizeCommentText(original);
+    failTexts.set(key, reason ?? '改写失败，已保持原文');
+    pendingTexts.delete(key);
     changed = true;
   }
   if (changed) applyDmTextReplacements();
@@ -461,8 +523,9 @@ function markDmSkipped(ids: string[], reason: string): void {
   for (const id of ids) {
     const original = idToText.get(id);
     if (original === undefined) continue;
-    skipTexts.set(original, reason);
-    pendingTexts.delete(original);
+    const key = normalizeCommentText(original);
+    skipTexts.set(key, reason);
+    pendingTexts.delete(key);
     changed = true;
   }
   if (changed) applyDmTextReplacements();

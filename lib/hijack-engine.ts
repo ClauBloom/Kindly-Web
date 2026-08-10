@@ -58,6 +58,11 @@ function pumpDanmakuBatches(): void {
 export function startHijack(adapter: SiteAdapter): void {
   adapterDanmaku = adapter.danmaku ?? null;
   adapter.danmaku?.startLiveProbe?.();
+  // B 站新版页面不再请求 view 接口（实测 2026-08）→ 弹幕阈值数据源失效；
+  // 从页面内嵌数据轮询读取弹幕总量（main world，document_start 时页面脚本尚未执行）
+  if (adapter.videoMeta?.extractDanmakuTotalFromPage) {
+    probeSsrVideoMeta(adapter.videoMeta);
+  }
   // 注册桥广播监听：处理 isolated 侧的 __bridge_ready 握手（此后 sendToExtension 才直发）。
   // 必须在 startHijack 立即注册，否则评论路径的 sendToExtension 会一直排队（bridgeReady 永不为 true）。
   listenFromExtension((msg) => {
@@ -69,6 +74,28 @@ export function startHijack(adapter: SiteAdapter): void {
   void syncMainConfig();
   hijackFetch(adapter);
   hijackXhr(adapter);
+}
+
+/** SSR 弹幕总量探测：300ms 起每 100ms 轮询，5s 超时（页面脚本设置 __INITIAL_STATE__ 需要时间） */
+const SSR_PROBE_INITIAL_DELAY_MS = 300;
+const SSR_PROBE_INTERVAL_MS = 100;
+const SSR_PROBE_MAX_ATTEMPTS = 50;
+
+function probeSsrVideoMeta(videoMeta: NonNullable<SiteAdapter['videoMeta']>): void {
+  let attempts = 0;
+  const tick = () => {
+    try {
+      const total = videoMeta.extractDanmakuTotalFromPage?.() ?? null;
+      if (total !== null) {
+        sendToExtension({ type: 'KW_VIDEO_META', danmakuTotal: total });
+        return;
+      }
+    } catch {
+      // 忽略单次异常，继续重试
+    }
+    if (++attempts < SSR_PROBE_MAX_ATTEMPTS) setTimeout(tick, SSR_PROBE_INTERVAL_MS);
+  };
+  setTimeout(tick, SSR_PROBE_INITIAL_DELAY_MS);
 }
 
 /** MAIN world 侧配置（隔离层经桥同步；供隐藏原文等屏上行为判断） */
@@ -142,7 +169,10 @@ async function handleReplyFetch(
         notifyHijackActive();
         sendToExtension({ type: 'KW_REWRITE_COMMENTS', items });
         // 通知 isolated：这批评论已送改写（隐藏原文模式在渲染后显示"重写中"占位）
-        sendToExtension({ type: 'KW_COMMENTS_PENDING', items: items.map((i) => ({ id: i.id, seq: i.seq })) });
+        sendToExtension({
+          type: 'KW_COMMENTS_PENDING',
+          items: items.map((i) => ({ id: i.id, seq: i.seq, path: i.path })),
+        });
       }
     })
     .catch(() => {});
@@ -213,7 +243,10 @@ function hijackXhr(adapter: SiteAdapter): void {
           if (items.length > 0) {
             notifyHijackActive();
             sendToExtension({ type: 'KW_REWRITE_COMMENTS', items });
-            sendToExtension({ type: 'KW_COMMENTS_PENDING', items: items.map((i) => ({ id: i.id, seq: i.seq })) });
+            sendToExtension({
+              type: 'KW_COMMENTS_PENDING',
+              items: items.map((i) => ({ id: i.id, seq: i.seq, path: i.path })),
+            });
           }
         } catch {
           // 非 JSON 响应，忽略

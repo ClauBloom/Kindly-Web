@@ -10,6 +10,21 @@ import { browser } from 'wxt/browser';
 export type Intensity = 'mild' | 'moderate' | 'strong';
 export type UIMode = 'replace' | 'bubble';
 
+/** 内置风格预设（下拉框选项；prompt 为空串 = 不注入额外指令） */
+export interface StylePreset {
+  id: string;
+  label: string;
+  /** 追加到 system prompt 的风格指令（"默认"预设为空串） */
+  prompt: string;
+}
+
+/** 用户自定义风格（配置页可增删） */
+export interface CustomStyle {
+  id: string;
+  name: string;
+  prompt: string;
+}
+
 export interface KindlyConfig {
   /** 配置结构版本（读时迁移，见 MIGRATIONS） */
   version: number;
@@ -46,6 +61,14 @@ export interface KindlyConfig {
   dmConcurrency: number;
   /** 弹幕每批条数（小批响应快、请求多；1–100） */
   dmBatchSize: number;
+  /** 输出风格：内置预置 id 或自定义风格 id（见 STYLE_PRESETS/customStyles） */
+  styleId: string;
+  /** 用户自定义风格列表（配置页增删） */
+  customStyles: CustomStyle[];
+  /** 瞬时失败（网络/解析）重试次数（0–5；0 = 不重试直接判失败） */
+  retryCount: number;
+  /** 网络失败重试基础间隔（秒；退避 = 间隔 × 2^(重试次数-1)，0 = 立即重试） */
+  retryIntervalSec: number;
 }
 
 /** 弹幕处理速度预设（快速 → 慢速）：高并发+小批 到 低并发+大批 */
@@ -61,7 +84,46 @@ export const DM_SPEED_PRESETS: Record<
 
 export type DmSpeedPreset = keyof typeof DM_SPEED_PRESETS | 'custom';
 
-export const CURRENT_CONFIG_VERSION = 1;
+/**
+ * 输出风格预设（配置页下拉框）。prompt 为追加到 system prompt 的
+ * "输出风格"指令；空串 = 不注入（默认仅改写，行为与旧版一致）。
+ * 文案依据各年代网络文化语料编写（详见调研：年度弹幕/流行语等）。
+ */
+export const STYLE_PRESETS: StylePreset[] = [
+  { id: 'default', label: '默认（仅改写）', prompt: '' },
+  {
+    id: 'bilibili-2010',
+    label: '2010年的B站',
+    prompt:
+      '模拟2010年前后B站早期弹幕氛围：中二、热血、宅气十足。善用早期弹幕文化元素——"2333/233"（大笑）、"wwww"、"=w="（颜文字）、"前方高能/高能预警"（提醒剧情转折）、空耳式谐音梗（如"阿姨洗铁路"=我爱你）、"中二病""节操"等当年圈内用语；可提及初音未来、东方Project、御坂美琴等当时热门角色梗。句子简短密集、弹幕感强、适当夸张。仍须友善、理性，不攻击他人，不改变事实信息。',
+  },
+  {
+    id: 'bilibili-2016',
+    label: '2016年的B站',
+    prompt:
+      '模拟2016年B站弹幕氛围：活泼调侃、爱玩梗。善用当年流行语——"666/6666"（夸赞）、"厉害了""可以的"、"老司机/飙车"（老道、带节奏）、"洪荒之力"（全力以赴）、"蓝瘦香菇"（难受想哭）、"一脸懵逼"（懵圈）；弹幕短句、节奏明快。仍须友善、理性，不攻击他人，不改变事实信息。',
+  },
+  {
+    id: 'bilibili-2019',
+    label: '2019年的B站',
+    prompt:
+      '模拟2019年B站弹幕氛围：玩梗圆熟、表达多样。善用当年热梗——"awsl"（被可爱到/见到大佬）、"妙啊"（赞叹或调侃）、"禁止套娃"（反对复读嵌套）、"泪目"（感动）、"我酸了/柠檬精"（羡慕）、"好嗨哟"（兴奋）；可玩梗但不过度滥用，弹幕短句。仍须友善、理性，不攻击他人，不改变事实信息。',
+  },
+  {
+    id: 'douyin-2019',
+    label: '2019年的抖音',
+    prompt:
+      '模拟2019年抖音短视频口吻：亲切热情、情绪外放。善用当年热词——"老铁/家人们"（称呼）、"奥利给"（加油打气）、"双击666"（夸赞）、"我太难了"（自嘲式诉苦）、"盘他"（逗弄/较劲）、"好嗨哟"（嗨起来）、"土味情话"式表达；句子短促有力、口语化、带节奏感。仍须友善、理性，不攻击他人，不改变事实信息。',
+  },
+  {
+    id: 'catgirl',
+    label: '猫娘',
+    prompt:
+      '模拟猫娘（猫耳萌娘）说话方式：句尾带"喵/喵呜/nya~"口癖，自称"本喵"，善用颜文字（如 >ω<、=^ω^=、ฅ(•ㅅ•)ฅ）；语气软萌、爱撒娇，把攻击或抱怨转化为撒娇式的小抱怨（如"哼，本喵才不理你喵～"）；句子简短可爱。仍须友善、理性，不攻击他人，不改变事实信息。',
+  },
+];
+
+export const CURRENT_CONFIG_VERSION = 3;
 
 export const DEFAULT_CONFIG: KindlyConfig = {
   version: CURRENT_CONFIG_VERSION,
@@ -81,13 +143,21 @@ export const DEFAULT_CONFIG: KindlyConfig = {
   dmPreset: 'standard',
   dmConcurrency: 16,
   dmBatchSize: 40,
+  styleId: 'default',
+  customStyles: [],
+  retryCount: 2,
+  retryIntervalSec: 1,
 };
 
 /**
  * 配置迁移链（借鉴 kiss-translator runDataMigration 的思路，结构就位）。
- * v1 起步：未来新增迁移时在此追加 `CURRENT_CONFIG_VERSION: (cfg) => ({...cfg, newField: default})`。
+ * v1→v2：新增输出风格字段（内置默认 + 空自定义列表）。
+ * v2→v3：新增失败重试设置（次数 + 基础间隔，沿用既有默认行为 2 次 / 1s）。
  */
-const MIGRATIONS: Record<number, (cfg: KindlyConfig) => KindlyConfig> = {};
+const MIGRATIONS: Record<number, (cfg: KindlyConfig) => KindlyConfig> = {
+  1: (cfg) => ({ ...cfg, styleId: 'default', customStyles: [] }),
+  2: (cfg) => ({ ...cfg, retryCount: 2, retryIntervalSec: 1 }),
+};
 
 export interface ProviderPreset {
   id: string;

@@ -50,8 +50,11 @@ export async function sha256(text: string): Promise<string> {
 
 /**
  * 缓存签名：改写结果受内容类型（评论/弹幕 prompt 不同）、服务商、模型、
- * 强度、昵称开关影响，任一变化 → 签名变化 → 缓存自动失效
+ * 强度、昵称开关、输出风格影响，任一变化 → 签名变化 → 缓存自动失效
  * （借鉴 kiss-translator 的 promptSig 思路）。
+ * style 为已解析的风格指令（resolveStyleInstruction 结果）；空串（默认
+ * 仅改写）时不追加签名段，与旧版缓存兼容。非默认风格的段带 prompt 版本
+ * 前缀（p2 = 统一改写规则，2026-08），prompt 规则变化后旧缓存自动失效。
  */
 export function cacheSigOf(
   baseURL: string,
@@ -59,6 +62,7 @@ export function cacheSigOf(
   intensity: string,
   includeAuthor: boolean,
   kind: 'comment' | 'danmaku' = 'comment',
+  style: string = '',
 ): string {
-  return `${baseURL}|${modelName}|${intensity}|${includeAuthor ? 1 : 0}|${kind}`;
+  return `${baseURL}|${modelName}|${intensity}|${includeAuthor ? 1 : 0}|${kind}${style ? `|p2|${style}` : ''}`;
 }

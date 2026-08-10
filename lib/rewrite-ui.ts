@@ -39,6 +39,8 @@ interface Entry {
   rewritten?: string;
   /** 评论在渲染列表中的顺序索引（B 站按 seq 定位） */
   seq?: number;
+  /** 评论渲染树定位路径（楼中楼 [顶层 seq, 子索引]） */
+  path?: number[];
   /** 隐藏原文模式：已替换为"重写中"占位（失败/还原时恢复原文） */
   hiddenOriginal?: boolean;
 }
@@ -46,12 +48,12 @@ interface Entry {
 let adapter: SiteAdapter | null = null;
 const registry = new Map<string, Entry>();
 /** 结果先于 DOM 渲染到达时的重试队列（mock/快速模型/大页面场景的竞态修复） */
-const pendingResults = new Map<string, { rewritten: string; seq?: number; attempts: number }>();
+const pendingResults = new Map<string, { rewritten: string; seq?: number; path?: number[]; original?: string; attempts: number }>();
 
 /** 隐藏模式占位文本（改写前不显示原文） */
 const PENDING_PLACEHOLDER = '重写中';
-const pendingErrors = new Map<string, { reason: RewriteReason; detail?: string; seq?: number; attempts: number }>();
-const PENDING_RETRY_MAX = 12; // 12 × 500ms ≈ 6s 窗口
+const pendingErrors = new Map<string, { reason: RewriteReason; detail?: string; seq?: number; path?: number[]; attempts: number }>();
+const PENDING_RETRY_MAX = 30; // 30 × 500ms ≈ 15s 窗口（懒加载评论区渲染可能晚于结果到达）
 const PENDING_RETRY_INTERVAL_MS = 500;
 let pendingRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let config: KindlyConfig | null = null;
@@ -69,10 +71,10 @@ export function startRewriteUi(site: SiteAdapter): void {
   browser.runtime.onMessage.addListener((msg) => {
     switch (msg?.type) {
       case 'KW_REWRITE_RESULT':
-        applyResult(msg.id, msg.rewritten, msg.seq);
+        applyResult(msg.id, msg.rewritten, msg.seq, msg.path, msg.original);
         break;
       case 'KW_REWRITE_ERROR':
-        applyError(msg.id, msg.reason, msg.detail, msg.seq);
+        applyError(msg.id, msg.reason, msg.detail, msg.seq, msg.path);
         break;
       case 'KW_SET_ENABLED':
         void setEnabled(msg.enabled);
@@ -105,11 +107,11 @@ export function startRewriteUi(site: SiteAdapter): void {
 /** 已送改写、结果未回的评论 id（隐藏原文模式占位用） */
 const pendingCommentIds = new Set<string>();
 
-function onCommentsPending(items: { id: string; seq?: number }[]): void {
+function onCommentsPending(items: { id: string; seq?: number; path?: number[] }[]): void {
   for (const item of items) pendingCommentIds.add(item.id);
   if (!config?.hideOriginalComment) return;
   for (const item of items) {
-    const entry = resolveEntry(item.id, item.seq);
+    const entry = resolveEntry(item.id, item.seq, item.path);
     if (entry && entry.status === 'pending') applyPendingPlaceholder(entry);
   }
 }
@@ -311,6 +313,7 @@ function resubmitSweep(): void {
     original: entry.original,
     status: 'pending',
     seq: entry.seq,
+    path: entry.path,
   }));
   void browser.runtime.sendMessage({ type: 'KW_REWRITE_COMMENTS', items }).catch(() => {});
 }
@@ -321,16 +324,24 @@ function entryIdOf(entry: Entry): string {
   return entry.root.dataset.kwId ?? '';
 }
 
-/** 按 id 定位节点并登记（优先注册表，其次站点定位器（seq 优先），最后 shadow 深度查找） */
-function resolveEntry(id: string, seq?: number): Entry | null {
+/** 按 id 定位节点并登记（优先注册表，其次站点定位器（path/seq 优先），最后 shadow 深度查找） */
+function resolveEntry(id: string, seq?: number, path?: number[], original?: string): Entry | null {
   const existing = registry.get(id);
   if (existing) return existing;
-  const root = adapter?.resolveCommentRoot(id, seq) ?? findShadowById(id);
+  const root = adapter?.resolveCommentRoot(id, seq, path, original) ?? findShadowById(id);
   if (!root) return null;
-  return collectEntry(root, id, seq);
+  const entry = collectEntry(root, id, seq, path);
+  if (!entry) return null;
+  // 原文校正：消息携带的接口原文与 DOM 文本规范化一致时，以接口原文为准
+  // （DOM 文本缺表情标记，校正后"原样返回"判断才准确，恢复原文也完整）
+  const normalize = adapter?.normalizeText;
+  if (original && normalize && normalize(original) === normalize(entry.original)) {
+    entry.original = original;
+  }
+  return entry;
 }
 
-function collectEntry(root: HTMLElement, id: string, seq?: number): Entry | null {
+function collectEntry(root: HTMLElement, id: string, seq?: number, path?: number[]): Entry | null {
   if (!adapter) return null;
   const sel = adapter.commentSelectors;
   const primaryContentSelector = sel.content.split(',')[0]?.trim() ?? '';
@@ -345,7 +356,7 @@ function collectEntry(root: HTMLElement, id: string, seq?: number): Entry | null
   const fallbackText = contentEl.textContent?.trim() ?? '';
   const original = (textNodes.length > 0 ? textNodes.map((t) => t.textContent).join('') : fallbackText).trim();
   if (original.length < MIN_TEXT_LENGTH || original.length > MAX_TEXT_LENGTH) return null;
-  const entry: Entry = { root, contentEl, textNodes, fallbackText, original, status: 'pending', sentAt: 0, seq };
+  const entry: Entry = { root, contentEl, textNodes, fallbackText, original, status: 'pending', sentAt: 0, seq, path };
   root.dataset.kwId = id;
   registry.set(id, entry);
   // 隐藏原文模式：该评论已送改写（劫持路径广播）→ 立即占位（渲染晚于发送的竞态）
@@ -355,17 +366,20 @@ function collectEntry(root: HTMLElement, id: string, seq?: number): Entry | null
 
 function entryAuthor(entry: Entry): string {
   if (!adapter) return '';
-  return entry.root.querySelector<HTMLElement>(adapter.commentSelectors.author)?.textContent?.trim() ?? '';
+  const node =
+    adapter.resolveAuthorNode?.(entry.root) ??
+    entry.root.querySelector<HTMLElement>(adapter.commentSelectors.author);
+  return node?.textContent?.trim() ?? '';
 }
 
 // ===== 结果应用 =====
 
-function applyResult(id: string, rewritten: string, seq?: number): void {
-  const entry = resolveEntry(id, seq);
+function applyResult(id: string, rewritten: string, seq?: number, path?: number[], original?: string): void {
+  const entry = resolveEntry(id, seq, path, original);
   if (!entry) {
     // DOM 尚未渲染（改写快于页面渲染）：排队等待重试
     if (!pendingResults.has(id)) {
-      pendingResults.set(id, { rewritten, seq, attempts: 0 });
+      pendingResults.set(id, { rewritten, seq, path, original, attempts: 0 });
       schedulePendingRetry();
     }
     return;
@@ -389,7 +403,7 @@ function schedulePendingRetry(): void {
         pendingResults.delete(id);
         continue;
       }
-      const entry = resolveEntry(id, p.seq);
+      const entry = resolveEntry(id, p.seq, p.path, p.original);
       if (entry && entry.status === 'pending') {
         pendingResults.delete(id);
         entry.status = 'success';
@@ -404,7 +418,7 @@ function schedulePendingRetry(): void {
         pendingErrors.delete(id);
         continue;
       }
-      const entry = resolveEntry(id, p.seq);
+      const entry = resolveEntry(id, p.seq, p.path);
       if (entry && entry.status === 'pending') {
         pendingErrors.delete(id);
         applyErrorToEntry(entry, p.reason, p.detail);
@@ -464,12 +478,12 @@ function restoreText(entry: Entry): void {
 }
 
 /** 失败角标：点击展开可交互浮层（原因 + 原始错误 + 重试） */
-function applyError(id: string, reason: RewriteReason, detail?: string, seq?: number): void {
+function applyError(id: string, reason: RewriteReason, detail?: string, seq?: number, path?: number[]): void {
   pendingCommentIds.delete(id);
-  const entry = resolveEntry(id, seq);
+  const entry = resolveEntry(id, seq, path);
   if (!entry) {
     if (!pendingErrors.has(id)) {
-      pendingErrors.set(id, { reason, detail, seq, attempts: 0 });
+      pendingErrors.set(id, { reason, detail, seq, path, attempts: 0 });
       schedulePendingRetry();
     }
     return;
@@ -509,7 +523,7 @@ function retryEntry(entry: Entry): void {
   entry.root.querySelector('.kw-badge')?.remove();
   entry.status = 'pending';
   entry.sentAt = Date.now();
-  const item: CommentItem = { id, author: entryAuthor(entry), original: entry.original, status: 'pending', seq: entry.seq };
+  const item: CommentItem = { id, author: entryAuthor(entry), original: entry.original, status: 'pending', seq: entry.seq, path: entry.path };
   void browser.runtime.sendMessage({ type: 'KW_REWRITE_COMMENTS', items: [item] }).catch(() => {});
 }
 

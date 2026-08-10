@@ -4,8 +4,9 @@
  * strong 全面友善化、允许调整句式。
  */
 
-import type { Intensity, KindlyConfig } from './config';
-import type { CommentItem } from './messages';
+import type { CustomStyle, Intensity, KindlyConfig } from './config.ts';
+import { STYLE_PRESETS } from './config.ts';
+import type { CommentItem } from './messages.ts';
 
 /** buildMessages 只依赖的条目字段（PendingItem 与 CommentItem 均满足） */
 type MessageItem = Pick<CommentItem, 'id' | 'author' | 'original'>;
@@ -16,12 +17,40 @@ const INTENSITY_RULES: Record<Intensity, string> = {
   strong: '全面友善化：允许调整句式结构，将负面情绪转化为温暖、理性、建设性的表达；不编造事实。',
 };
 
+/**
+ * "原样返回"规则按输出风格切换：
+ *  - 默认（仅改写，style 为空）：友善内容不加工，原样返回（既有行为）
+ *  - 风格化（style 非空）：**统一改写**——所有条目都要套用风格重新表达，
+ *    否则风格预设无法统一生效（用户要求；2026-08）
+ */
+function originalReturnRule(style: string): string {
+  if (style) {
+    return '所有条目都必须改写：即使是友善内容也要按风格要求重新表达（套用风格用语与语气）；仅当内容无实际语义（纯符号、表情、过短）时原样返回。';
+  }
+  return '若某条评论本身已友善，或内容无实际语义（纯符号、表情、过短），原样返回该文本。';
+}
+
+/**
+ * 解析当前选中的输出风格指令：内置预置取 STYLE_PRESETS.prompt，
+ * 自定义风格按 styleId 在 customStyles 中查找；未知 id 回退空串（仅改写）。
+ */
+export function resolveStyleInstruction(
+  config: Pick<KindlyConfig, 'styleId' | 'customStyles'>,
+): string {
+  const preset = STYLE_PRESETS.find((p) => p.id === config.styleId);
+  if (preset) return preset.prompt;
+  const custom = config.customStyles.find((c: CustomStyle) => c.id === config.styleId);
+  return custom?.prompt.trim() ?? '';
+}
+
 export function buildMessages(
-  config: Pick<KindlyConfig, 'intensity' | 'includeAuthor'>,
+  config: Pick<KindlyConfig, 'intensity' | 'includeAuthor' | 'styleId' | 'customStyles'>,
   items: MessageItem[],
   kind: 'comment' | 'danmaku' = 'comment',
 ): { role: 'system' | 'user'; content: string }[] {
   const rule = INTENSITY_RULES[config.intensity];
+  const style = resolveStyleInstruction(config);
+  const originalRule = originalReturnRule(style);
   // 注意：不要用「条件运算符 ? 多行模板字符串」——TypeScript 5.8.3 解析器
   // 对该组合会误报 TS1005（模板收尾处 ':' expected），用 if 语句规避。
   let system: string;
@@ -30,17 +59,21 @@ export function buildMessages(
 请逐条将它们重写为友善、理性、保持原意的表达。输出规则：
 1. 只输出一个 JSON 对象，键为弹幕 id，值为改写后的文本；不要输出任何多余文字，不要使用 Markdown 代码块标记。
 2. 保持弹幕风格：简短（不超过 20 字）、口语化；不要添加原文没有的内容或解释。
-3. 若某条弹幕本身已友善，或内容无实际语义（纯符号、表情、过短），原样返回该文本。
+3. ${originalRule}
 4. 识别网络梗与品牌黑称：充分结合当前网络流行语、品牌关联语境进行联想匹配，对关键词精准识别——品牌/群体黑称与谐音梗（如「higo/海狗」「花粉/海军」指代华为用户，「米猴/猴米」指代小米用户，「果蛆/苹狗」指代苹果用户等）以及产品暗示性攻击（如「智商税」「爱国税」「买办」等阴阳怪气标签），改写为中性指代（如「华为用户」「小米用户」「该品牌用户」），保留理性批评但消除恶意标签与群体攻击；不要把正常品牌讨论误判为黑称。
 5. 改写力度：${rule}`;
   } else {
     system = `你是一个「友善改写器」。用户会给你若干条网络评论，其中可能含有攻击性、阴阳怪气或负面情绪。
 请逐条将它们重写为友善、理性、保持原意的表达。输出规则：
 1. 只输出一个 JSON 对象，键为评论 id，值为改写后的文本；不要输出任何多余文字，不要使用 Markdown 代码块标记。
-2. 若某条评论本身已友善，或内容无实际语义（纯符号、表情、过短），原样返回该文本。
+2. ${originalRule}
 3. 识别网络梗与品牌黑称：充分结合当前网络流行语、品牌关联语境进行联想匹配，对关键词精准识别——品牌/群体黑称与谐音梗（如「higo/海狗」「花粉/海军」指代华为用户，「米猴/猴米」指代小米用户，「果蛆/苹狗」指代苹果用户等）以及产品暗示性攻击（如「智商税」「爱国税」「买办」等阴阳怪气标签），改写为中性指代（如「华为用户」「小米用户」「该品牌用户」），保留理性批评但消除恶意标签与群体攻击；不要把正常品牌讨论误判为黑称。
 4. 不要添加原文没有的事实、观点或标签。
 5. 改写力度：${rule}`;
+  }
+  // 输出风格指令：空串（默认仅改写）时不追加，保持提示词与旧版一致
+  if (style) {
+    system += `\n6. 输出风格：${style}`;
   }
 
   const payload = items.map((it) =>

@@ -55,6 +55,12 @@ export interface SiteVideoMeta {
   matchUrl(url: string): boolean;
   /** 从响应提取弹幕总量（stat.danmaku 等）；拿不到返回 null */
   extractDanmakuTotal(data: unknown): number | null;
+  /**
+   * 从页面内嵌数据提取弹幕总量（B 站新版页面不再请求 view 接口，实测 2026-08：
+   * 视频信息内嵌于 window.__INITIAL_STATE__.videoData.stat.danmaku）。
+   * main world 轮询读取（document_start 时页面脚本尚未执行）；返回 null = 暂不可用。
+   */
+  extractDanmakuTotalFromPage?(): number | null;
 }
 
 export interface SiteAdapter {
@@ -66,18 +72,27 @@ export interface SiteAdapter {
   matches: string[];
   /** 评论 API URL 匹配（main world，劫持层） */
   matchReplyUrl(url: string): boolean;
-  /** 评论响应提取（响应 JSON → CommentItem[]，零阻塞路径；seq 由适配器填充） */
+  /** 评论响应提取（响应 JSON → CommentItem[]，零阻塞路径；seq/path 由适配器填充） */
   extractReplies(data: unknown, url: string): CommentItem[];
   /**
    * 按 id（rpid 等）定位评论 DOM 节点（isolated world，结果应用）。
-   * seq = 接口响应索引（B 站评论区 DOM 无 rpid 属性，只能按顺序定位）。
+   * seq = 接口响应索引（B 站评论区 DOM 无 rpid 属性，只能按顺序定位）；
+   * path = 渲染树路径（path[0] = #feed 顶层索引，后续为楼中楼逐层子索引），
+   * 楼中楼回复必须提供 path；original 供文本匹配兜底（列表顺序变化时防错位）。
    */
-  resolveCommentRoot(id: string, seq?: number): HTMLElement | null;
+  resolveCommentRoot(id: string, seq?: number, path?: number[], original?: string): HTMLElement | null;
   /**
    * 定位评论条目的文本容器（B 站评论文本在多层嵌套 shadow 的 bili-rich-text 内，
    * 通用选择器无法表达 → 适配器提供；返回 null 时回退 commentSelectors.content）
    */
   resolveContentNode?(root: HTMLElement): HTMLElement | null;
+  /** 定位评论者昵称节点（顶层/楼中楼结构不同且均在 shadow 内；缺失时回退 commentSelectors.author） */
+  resolveAuthorNode?(root: HTMLElement): HTMLElement | null;
+  /**
+   * 评论文本规范化（去掉平台表情标记、压缩空白）：DOM 渲染后表情变图片，
+   * textContent 与接口原文不一致，文本匹配必须经规范化比较。
+   */
+  normalizeText?(text: string): string;
   /** 评论 DOM 选择器（isolated world，结果应用与兜底采集） */
   commentSelectors: SiteCommentSelectors;
   /** 弹幕能力（站点无弹幕则不提供） */

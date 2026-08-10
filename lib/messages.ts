@@ -26,6 +26,12 @@ export interface CommentItem {
    * 结果应用按接口顺序 ↔ #feed 内 thread renderer 顺序定位）
    */
   seq?: number;
+  /**
+   * 评论在评论区渲染树中的定位路径：path[0] = 顶层评论在 #feed 的索引，
+   * 后续元素 = 楼中楼逐层子索引（如 [3, 1] = 第 4 个顶层线程下的第 2 条回复）。
+   * 顶层评论与 seq 等价（[seq]）；楼中楼回复必须带 path 才能定位。
+   */
+  path?: number[];
 }
 
 export type RewriteReason = NonNullable<CommentItem['error']>;
@@ -39,8 +45,8 @@ export type RuntimeMessage =
       results: { id: string; rewritten: string }[];
       skipped?: boolean; // 整批因阈值跳过（非失败，弹幕保持原文并打"跳过"标识）
     } // SW → tab
-  | { type: 'KW_REWRITE_RESULT'; id: string; rewritten: string; seq?: number } // SW → CS
-  | { type: 'KW_REWRITE_ERROR'; id: string; reason: RewriteReason; detail?: string; seq?: number } // SW → CS
+  | { type: 'KW_REWRITE_RESULT'; id: string; rewritten: string; seq?: number; path?: number[]; original?: string } // SW → CS（original 供楼中楼文本兜底定位）
+  | { type: 'KW_REWRITE_ERROR'; id: string; reason: RewriteReason; detail?: string; seq?: number; path?: number[] } // SW → CS
   | {
       type: 'KW_FAILURE_LOG';
       kind: 'comment' | 'danmaku';
@@ -56,7 +62,7 @@ export type RuntimeMessage =
   | { type: 'KW_CONFIG_CHANGED' } // options/onboarding → SW → tabs
   | { type: 'KW_HIJACK_ACTIVE' } // main-world hijack → isolated CS（劫持已生效，跳过 observer 兜底）
   | { type: 'KW_VIDEO_META'; danmakuTotal: number } // main-world hijack → SW（视频弹幕总量，阈值判断用）
-  | { type: 'KW_COMMENTS_PENDING'; items: { id: string; seq?: number }[] } // main-world hijack → SW → tab（评论已送改写，隐藏原文占位用）
+  | { type: 'KW_COMMENTS_PENDING'; items: { id: string; seq?: number; path?: number[] }[] } // main-world hijack → SW → tab（评论已送改写，隐藏原文占位用）
   | { type: 'KW_GET_STATUS' } // popup → SW
   | {
       type: 'KW_STATUS';

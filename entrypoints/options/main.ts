@@ -15,8 +15,9 @@ import {
   requestOriginAccess,
   saveConfig,
   setApiKey,
+  STYLE_PRESETS,
 } from '@/lib/config';
-import type { Intensity, KindlyConfig, UIMode } from '@/lib/config';
+import type { CustomStyle, Intensity, KindlyConfig, UIMode } from '@/lib/config';
 import { t } from '@/lib/i18n';
 import { allAdapters } from '@/lib/sites/registry';
 import type { TestResult } from '@/lib/messages';
@@ -27,6 +28,8 @@ function $(id: string): HTMLElement {
 
 let config: KindlyConfig;
 let savedKey = '';
+/** 自定义风格工作副本：增删后仅更新内存，保存时写回配置 */
+let customStyles: CustomStyle[] = [];
 
 async function main(): Promise<void> {
   config = await getConfig();
@@ -45,8 +48,13 @@ async function main(): Promise<void> {
   (document.querySelector('label[for="apiKey"]') as HTMLElement).textContent = t('opt.api.key');
   $('intensity-label').textContent = t('popup.intensity');
   $('mode-label').textContent = t('onb.step4.mode');
+  $('stylePreset-label').textContent = t('opt.rewrite.stylePreset');
+  $('customStyles-label').textContent = t('opt.rewrite.customStyles');
+  $('btn-add-custom-style').textContent = t('opt.rewrite.customStyle.add');
   (document.querySelector('label[for="batchSize"]') as HTMLElement).textContent = t('opt.rewrite.batchSize');
   (document.querySelector('label[for="timeoutMs"]') as HTMLElement).textContent = t('opt.rewrite.timeout');
+  (document.querySelector('label[for="retryCount"]') as HTMLElement).textContent = t('opt.rewrite.retryCount');
+  (document.querySelector('label[for="retryIntervalSec"]') as HTMLElement).textContent = t('opt.rewrite.retryIntervalSec');
   (document.querySelector('label[for="danmakuMaxTotal"]') as HTMLElement).textContent = t('opt.rewrite.danmakuMaxTotal');
   (document.querySelector('label[for="dmConcurrency"]') as HTMLElement).textContent = t('opt.rewrite.dmConcurrency');
   (document.querySelector('label[for="dmBatchSize"]') as HTMLElement).textContent = t('opt.rewrite.dmBatchSize');
@@ -74,11 +82,16 @@ async function main(): Promise<void> {
   ($('apiKey') as HTMLInputElement).value = savedKey;
   ($('batchSize') as HTMLInputElement).value = String(config.batchSize);
   ($('timeoutMs') as HTMLInputElement).value = String(Math.round(config.timeoutMs / 1000));
+  ($('retryCount') as HTMLInputElement).value = String(config.retryCount);
+  ($('retryIntervalSec') as HTMLInputElement).value = String(config.retryIntervalSec);
   ($('includeAuthor') as HTMLInputElement).checked = config.includeAuthor;
   ($('hideOriginalComment') as HTMLInputElement).checked = config.hideOriginalComment;
   ($('hideOriginalDanmaku') as HTMLInputElement).checked = config.hideOriginalDanmaku;
   buildDmSpeedControls(config);
   buildDanmakuMaxTotalSelect(config.danmakuMaxTotal);
+  customStyles = [...config.customStyles];
+  buildStyleSelect();
+  buildCustomStyleList();
   buildSiteList();
   updateKeyHint();
 
@@ -95,6 +108,7 @@ async function main(): Promise<void> {
   });
   $('btn-test').addEventListener('click', () => void runTest());
   $('btn-save').addEventListener('click', () => void save());
+  $('btn-add-custom-style').addEventListener('click', addCustomStyle);
   $('btn-clear-cache').addEventListener('click', () => void clearCache());
   $('btn-review-onboarding').addEventListener('click', () => {
     void browser.tabs.create({ url: browser.runtime.getURL('/onboarding.html') });
@@ -165,6 +179,89 @@ function buildDanmakuMaxTotalSelect(current: number | null): void {
   select.value = current === null ? '' : String(current);
 }
 
+/**
+ * 输出风格下拉：内置预置 + 用户自定义（"自定义·名称"）。
+ * 配置中的 styleId 已失效（如对应自定义风格被删）时回退默认。
+ */
+function buildStyleSelect(): void {
+  const select = $('stylePreset') as HTMLSelectElement;
+  select.innerHTML = '';
+  for (const preset of STYLE_PRESETS) {
+    const opt = document.createElement('option');
+    opt.value = preset.id;
+    opt.textContent = preset.label;
+    select.appendChild(opt);
+  }
+  for (const custom of customStyles) {
+    const opt = document.createElement('option');
+    opt.value = custom.id;
+    opt.textContent = `自定义 · ${custom.name}`;
+    select.appendChild(opt);
+  }
+  const known = STYLE_PRESETS.some((p) => p.id === config.styleId) ||
+    customStyles.some((c) => c.id === config.styleId);
+  if (!known) config.styleId = 'default';
+  select.value = config.styleId;
+}
+
+/** 自定义风格列表：每行名称 + 指令预览 + 删除按钮 */
+function buildCustomStyleList(): void {
+  const box = $('custom-style-list');
+  box.innerHTML = '';
+  for (const custom of customStyles) {
+    const row = document.createElement('div');
+    row.className = 'custom-style-row';
+    const info = document.createElement('div');
+    info.className = 'custom-style-info';
+    const name = document.createElement('span');
+    name.className = 'custom-style-name';
+    name.textContent = custom.name;
+    const prompt = document.createElement('span');
+    prompt.className = 'custom-style-prompt';
+    prompt.textContent = custom.prompt;
+    info.append(name, prompt);
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'btn-link custom-style-del';
+    del.textContent = t('opt.rewrite.customStyle.delete');
+    del.addEventListener('click', () => {
+      deleteCustomStyle(custom.id);
+    });
+    row.append(info, del);
+    box.appendChild(row);
+  }
+  if (customStyles.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'hint custom-style-empty';
+    empty.textContent = t('opt.rewrite.customStyle.empty');
+    box.appendChild(empty);
+  }
+}
+
+function addCustomStyle(): void {
+  const name = ($('customStyleName') as HTMLInputElement).value.trim();
+  const prompt = ($('customStylePrompt') as HTMLTextAreaElement).value.trim();
+  if (!name) return toast(t('opt.rewrite.customStyle.needName'));
+  if (!prompt) return toast(t('opt.rewrite.customStyle.needPrompt'));
+  if (name.length > 20) return toast(t('opt.rewrite.customStyle.nameTooLong'));
+  if (prompt.length > 500) return toast(t('opt.rewrite.customStyle.promptTooLong'));
+  const id = `custom-${Date.now()}`;
+  customStyles.push({ id, name, prompt });
+  config.styleId = id;
+  ($('customStyleName') as HTMLInputElement).value = '';
+  ($('customStylePrompt') as HTMLTextAreaElement).value = '';
+  buildStyleSelect();
+  buildCustomStyleList();
+}
+
+function deleteCustomStyle(id: string): void {
+  customStyles = customStyles.filter((c) => c.id !== id);
+  if (config.styleId === id) config.styleId = 'default';
+  buildStyleSelect();
+  buildCustomStyleList();
+  toast(t('opt.rewrite.customStyle.deleted'));
+}
+
 function onProviderChange(): void {
   const id = ($('provider') as HTMLSelectElement).value;
   const preset = PROVIDER_PRESETS.find((p) => p.id === id);
@@ -230,6 +327,10 @@ async function save(): Promise<void> {
   if (!baseURL || !modelName) return toast('请填写接口地址与模型名称');
   if (!Number.isFinite(batchSize) || batchSize < 1 || batchSize > 20) return toast('每批评论数需在 1–20 之间');
   if (!Number.isFinite(timeoutSec) || timeoutSec < 5 || timeoutSec > 120) return toast('请求超时需在 5–120 秒之间');
+  const retryCount = Number(($('retryCount') as HTMLInputElement).value);
+  const retryIntervalSec = Number(($('retryIntervalSec') as HTMLInputElement).value);
+  if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 5) return toast('重试次数需为 0–5 的整数');
+  if (!Number.isInteger(retryIntervalSec) || retryIntervalSec < 0 || retryIntervalSec > 30) return toast('重试间隔需为 0–30 的整数（秒）');
 
   // 自定义域名权限（用户手势内）
   if (!(await hasOriginAccess(baseURL))) {
@@ -257,6 +358,8 @@ async function save(): Promise<void> {
       modelName,
       batchSize,
       timeoutMs: timeoutSec * 1000,
+      retryCount,
+      retryIntervalSec,
       includeAuthor: ($('includeAuthor') as HTMLInputElement).checked,
       hideOriginalComment: ($('hideOriginalComment') as HTMLInputElement).checked,
       hideOriginalDanmaku: ($('hideOriginalDanmaku') as HTMLInputElement).checked,
@@ -265,6 +368,8 @@ async function save(): Promise<void> {
       dmPreset: presetMatch ?? 'custom',
       dmConcurrency,
       dmBatchSize,
+      styleId: ($('stylePreset') as HTMLSelectElement).value,
+      customStyles,
       onboardingDone: true,
     }),
   ]);

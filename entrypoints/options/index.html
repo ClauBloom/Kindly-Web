@@ -65,6 +65,19 @@
             <div class="segmented" id="intensity" role="radiogroup"></div>
           </div>
           <div class="form-field">
+            <span class="field-label" id="stylePreset-label"></span>
+            <select id="stylePreset"></select>
+          </div>
+          <div class="form-field checkbox-field">
+            <span class="field-label" id="customStyles-label"></span>
+            <div id="custom-style-list"></div>
+            <div class="custom-add">
+              <input id="customStyleName" type="text" maxlength="20" spellcheck="false" autocomplete="off" />
+              <textarea id="customStylePrompt" rows="2" maxlength="500" spellcheck="false"></textarea>
+              <button id="btn-add-custom-style" type="button" class="btn btn-ghost"></button>
+            </div>
+          </div>
+          <div class="form-field">
             <span class="field-label" id="mode-label"></span>
             <div class="segmented segmented-2" id="mode" role="radiogroup"></div>
           </div>
@@ -75,6 +88,14 @@
           <div class="form-field inline">
             <label for="timeoutMs"></label>
             <input id="timeoutMs" type="number" min="5" max="120" />
+          </div>
+          <div class="form-field inline">
+            <label for="retryCount"></label>
+            <input id="retryCount" type="number" min="0" max="5" />
+          </div>
+          <div class="form-field inline">
+            <label for="retryIntervalSec"></label>
+            <input id="retryIntervalSec" type="number" min="0" max="30" />
           </div>
           <div class="form-field inline">
             <label for="danmakuMaxTotal"></label>
