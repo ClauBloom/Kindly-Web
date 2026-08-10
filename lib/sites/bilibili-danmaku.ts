@@ -359,6 +359,31 @@ function startDmDomObserver(maxAttempts = 15, intervalMs = 2000): void {
   tick();
 }
 
+/**
+ * 弹幕文本写入：把文本中的 [表情] 标记替换回元素内已有的表情 img（B 站弹幕
+ * 表情与评论同构：img[alt="[doge]"]；实测受限，匹配不到时退化为纯文本）。
+ */
+function setDmText(el: HTMLElement, text: string): void {
+  const emotes = new Map<string, Element>();
+  for (const img of el.querySelectorAll<HTMLImageElement>('img[alt^="["]')) {
+    if (!emotes.has(img.alt)) emotes.set(img.alt, img);
+  }
+  const parts = text.split(/(\[[^\]\n]{1,20}\])/g);
+  const frag = document.createDocumentFragment();
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith('[') && part.endsWith(']')) {
+      const emote = emotes.get(part);
+      if (emote) {
+        frag.appendChild(emote.cloneNode(true));
+        continue;
+      }
+    }
+    frag.appendChild(document.createTextNode(part));
+  }
+  el.replaceChildren(frag);
+}
+
 /** 按原文匹配现存/新增弹幕 DOM 元素并替换为改写文本 */
 function applyDmTextReplacements(): void {
   if (!dmContainer) return;
@@ -370,8 +395,9 @@ function applyDmTextReplacements(): void {
     if (raw === '') continue;
     const key = normalizeCommentText(raw);
     const rewritten = rewriteResults.get(key);
-    if (rewritten !== undefined && el.textContent !== rewritten) {
-      el.textContent = rewritten;
+    // 已替换（含表情重建后文本无标记）→ 规范化比较防重复重建
+    if (rewritten !== undefined && normalizeCommentText(el.textContent ?? '') !== normalizeCommentText(rewritten)) {
+      setDmText(el, rewritten);
       delete el.dataset.kwDmOrig;
     }
     // 失败：恢复原文 + 红标（隐藏模式下也不保留占位）

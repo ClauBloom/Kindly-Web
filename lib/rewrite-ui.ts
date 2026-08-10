@@ -32,6 +32,8 @@ interface Entry {
   contentEl: HTMLElement;
   /** 内容中的纯文本节点（替换时保留元素子节点：emoji / @提及 / 链接） */
   textNodes: Text[];
+  /** 原文中的表情元素（alt = [表情标记]；B 站渲染为 img，替换/恢复时克隆复用） */
+  emotes: Map<string, Element>;
   fallbackText: string;
   original: string;
   status: 'pending' | 'success' | 'error';
@@ -290,13 +292,8 @@ function applyPendingPlaceholder(entry: Entry): void {
   if (entry.hiddenOriginal) return;
   entry.hiddenOriginal = true;
   mutateText(entry, () => {
-    const [first, ...rest] = entry.textNodes;
-    if (first) {
-      first.textContent = PENDING_PLACEHOLDER;
-      for (const node of rest) node.textContent = '';
-    } else {
-      entry.contentEl.textContent = PENDING_PLACEHOLDER;
-    }
+    rebuildTextWithEmotes(entry.contentEl, entry.emotes, PENDING_PLACEHOLDER);
+    entry.textNodes = collectTextNodes(entry.contentEl);
   });
 }
 
@@ -350,13 +347,22 @@ function collectEntry(root: HTMLElement, id: string, seq?: number, path?: number
     root.querySelector<HTMLElement>(sel.content) ??
     (primaryContentSelector && root.matches(primaryContentSelector) ? root : null) ??
     root;
-  const textNodes = Array.from(contentEl.childNodes).filter(
-    (n): n is Text => n.nodeType === Node.TEXT_NODE && Boolean(n.textContent?.trim()),
-  );
+  const textNodes = collectTextNodes(contentEl);
   const fallbackText = contentEl.textContent?.trim() ?? '';
   const original = (textNodes.length > 0 ? textNodes.map((t) => t.textContent).join('') : fallbackText).trim();
   if (original.length < MIN_TEXT_LENGTH || original.length > MAX_TEXT_LENGTH) return null;
-  const entry: Entry = { root, contentEl, textNodes, fallbackText, original, status: 'pending', sentAt: 0, seq, path };
+  const entry: Entry = {
+    root,
+    contentEl,
+    textNodes,
+    emotes: collectEmotes(contentEl),
+    fallbackText,
+    original,
+    status: 'pending',
+    sentAt: 0,
+    seq,
+    path,
+  };
   root.dataset.kwId = id;
   registry.set(id, entry);
   // 隐藏原文模式：该评论已送改写（劫持路径广播）→ 立即占位（渲染晚于发送的竞态）
@@ -453,27 +459,57 @@ function mutateText(entry: Entry, apply: () => void): void {
   }
 }
 
+/** 收集内容中的非空文本节点 */
+function collectTextNodes(el: HTMLElement): Text[] {
+  return Array.from(el.childNodes).filter(
+    (n): n is Text => n.nodeType === Node.TEXT_NODE && Boolean(n.textContent?.trim()),
+  );
+}
+
+/**
+ * 收集表情元素：B 站把 [表情] 渲染为 <img alt="[doge]" src="//i0.hdslb.com/bfs/emote/…">
+ * （实测 2026-08），alt 即原文标记。同一标记多次出现取首个，克隆复用。
+ */
+function collectEmotes(el: HTMLElement): Map<string, Element> {
+  const emotes = new Map<string, Element>();
+  for (const img of el.querySelectorAll<HTMLImageElement>('img[alt^="["]')) {
+    if (!emotes.has(img.alt)) emotes.set(img.alt, img);
+  }
+  return emotes;
+}
+
+/**
+ * 按文本重建内容节点：把文本中的 [表情] 标记替换回原表情元素（克隆），
+ * 其余为文本节点。避免改写结果中表情标记显示为字面文本。
+ */
+function rebuildTextWithEmotes(contentEl: HTMLElement, emotes: Map<string, Element>, text: string): void {
+  const parts = text.split(/(\[[^\]\n]{1,20}\])/g);
+  const frag = document.createDocumentFragment();
+  for (const part of parts) {
+    if (!part) continue;
+    if (part.startsWith('[') && part.endsWith(']')) {
+      const emote = emotes.get(part);
+      if (emote) {
+        frag.appendChild(emote.cloneNode(true));
+        continue;
+      }
+    }
+    frag.appendChild(document.createTextNode(part));
+  }
+  contentEl.replaceChildren(frag);
+}
+
 function replaceText(entry: Entry, text: string): void {
   mutateText(entry, () => {
-    const [first, ...rest] = entry.textNodes;
-    if (first) {
-      first.textContent = text;
-      for (const node of rest) node.textContent = '';
-    } else {
-      entry.contentEl.textContent = text;
-    }
+    rebuildTextWithEmotes(entry.contentEl, entry.emotes, text);
+    entry.textNodes = collectTextNodes(entry.contentEl);
   });
 }
 
 function restoreText(entry: Entry): void {
   mutateText(entry, () => {
-    const [first, ...rest] = entry.textNodes;
-    if (first) {
-      first.textContent = entry.original;
-      for (const node of rest) node.textContent = '';
-    } else {
-      entry.contentEl.textContent = entry.original;
-    }
+    rebuildTextWithEmotes(entry.contentEl, entry.emotes, entry.original);
+    entry.textNodes = collectTextNodes(entry.contentEl);
   });
 }
 
@@ -627,9 +663,8 @@ function removeVisual(entry: Entry): void {
       const clone = entry.contentEl.cloneNode(true) as HTMLElement;
       entry.contentEl.replaceWith(clone);
       entry.contentEl = clone;
-      entry.textNodes = Array.from(clone.childNodes).filter(
-        (n): n is Text => n.nodeType === Node.TEXT_NODE && Boolean(n.textContent?.trim()),
-      );
+      entry.textNodes = collectTextNodes(clone);
+      entry.emotes = collectEmotes(clone);
     });
     delete entry.root.dataset.kwHover;
   }
