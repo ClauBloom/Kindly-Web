@@ -17,7 +17,8 @@ import type { KindlyConfig } from '@/lib/config';
 import { buildMessages, resolveStyleInstruction } from '@/lib/prompt';
 import { cacheGet, cacheSet, cacheSigOf } from '@/lib/cache';
 import { classifyFetchError, classifyHttpStatus, extractErrorDetail } from '@/lib/errors';
-import { parseRewrites } from '@/lib/response-parser';
+import { createIncrementalJsonParser, parseRewrites } from '@/lib/response-parser';
+import { createSseContentReader, extractSseContent } from '@/lib/sse';
 import type { CommentItem, RewriteReason, RuntimeMessage, StatusPayload } from '@/lib/messages';
 
 /**
@@ -357,8 +358,9 @@ async function fire(batch: Batch): Promise<void> {
     resolveStyleInstruction(config),
   );
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  let res: Response;
   try {
-    const res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/chat/completions`, {
+    res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
@@ -366,60 +368,134 @@ async function fire(batch: Batch): Promise<void> {
         messages: buildMessages(config, batch.items, kind),
         temperature: 0.6,
         max_tokens: kind === 'danmaku' ? 1024 : 2048,
+        stream: true,
+        ...thinkingDisabledParam(config),
       }),
       signal: controller.signal,
     });
-
-    if (res.status === 401 || res.status === 403) {
-      finishBatch(batch, 'auth', await extractErrorDetail(res));
-      return;
-    }
-    if (res.status === 429) {
-      handleRateLimited(batch, res, await extractErrorDetail(res));
-      return;
-    }
-    if (!res.ok) {
-      handleTransientFailure(batch, classifyHttpStatus(res.status), await extractErrorDetail(res));
-      return;
-    }
-
-    const data: unknown = await res.json().catch(() => null);
-    const content = extractContent(data);
-    if (typeof content !== 'string' || content.trim() === '') {
-      handleTransientFailure(batch, 'parse', typeof content === 'string' ? content : '（响应无文本内容）');
-      return;
-    }
-    const rewrittenMap = parseRewrites(content, batch.items);
-    if (!rewrittenMap) {
-      handleTransientFailure(batch, 'parse', content);
-      return;
-    }
-    await handleSuccess(batch, rewrittenMap, sig);
   } catch (err) {
+    // 请求本身失败（未建立连接/网络错误）：无任何交付，按瞬时失败重试
     handleTransientFailure(batch, classifyFetchError(err));
-  } finally {
     clearTimeout(timer);
     inFlight.delete(batch);
     aborts.delete(batch);
     persistMirror();
     void schedule();
+    return;
   }
-}
 
-function handleSuccess(batch: Batch, map: Map<string, string>, sig: string): Promise<void> {
-  return (async () => {
-    for (const item of batch.items) {
-      let rewritten = map.get(item.id);
-      if (typeof rewritten !== 'string' || rewritten.trim() === '') {
-        rewritten = item.original; // 空内容/无意义改写 → 保留原文
+  if (res.status === 401 || res.status === 403) {
+    finishBatch(batch, 'auth', await extractErrorDetail(res));
+    clearTimeout(timer);
+    inFlight.delete(batch);
+    aborts.delete(batch);
+    persistMirror();
+    void schedule();
+    return;
+  }
+  if (res.status === 429) {
+    handleRateLimited(batch, res, await extractErrorDetail(res));
+    clearTimeout(timer);
+    inFlight.delete(batch);
+    aborts.delete(batch);
+    persistMirror();
+    void schedule();
+    return;
+  }
+  if (!res.ok) {
+    handleTransientFailure(batch, classifyHttpStatus(res.status), await extractErrorDetail(res));
+    clearTimeout(timer);
+    inFlight.delete(batch);
+    aborts.delete(batch);
+    persistMirror();
+    void schedule();
+    return;
+  }
+
+  // ===== 流式读取 + 增量交付（首条结果到达即应用，无需等整批）=====
+  const delivered = new Set<string>();
+  const sseReader = createSseContentReader();
+  const incremental = createIncrementalJsonParser();
+  let sseText = '';
+  let streamError: RewriteReason | null = null;
+  try {
+    if (!res.body) throw new Error('响应无 body');
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      sseText += chunk;
+      // 本块到达的 content 增量（SSE 行缓冲跨 chunk 处理）→ 增量 JSON 解析
+      const delta = sseReader.push(chunk);
+      for (const [id, valueText] of incremental.push(delta)) {
+        if (delivered.has(id)) continue;
+        const item = batch.items.find((it) => it.id === id);
+        if (!item) continue;
+        delivered.add(id);
+        // 空输出视作"无意义改写"→ 交付原文（与 handleSuccess 语义一致）
+        const rewritten = valueText.trim() === '' ? item.original : valueText.trim();
+        void cacheSet(item.original, sig, rewritten);
+        stats.totalRewritten++;
+        deliverResult(batch.tabId, item, rewritten);
       }
-      rewritten = rewritten.trim();
-      void cacheSet(item.original, sig, rewritten);
-      stats.totalRewritten++;
-      deliverResult(batch.tabId, item, rewritten);
     }
+    sseText += decoder.decode();
+  } catch (err) {
+    streamError = classifyFetchError(err);
+  }
+
+  const missing = batch.items.filter((it) => !delivered.has(it.id));
+  if (missing.length > 0 && streamError === null) {
+    // 流正常结束但有条目未增量交付：整批解析兜底（兼容非标准输出形态）
+    const content = extractSseContent(sseText);
+    if (content.trim() !== '') {
+      const map = parseRewrites(content, batch.items);
+      if (map) {
+        for (const item of missing) {
+          const r = map.get(item.id);
+          if (typeof r === 'string' && r.trim() !== '') {
+            delivered.add(item.id);
+            void cacheSet(item.original, sig, r.trim());
+            stats.totalRewritten++;
+            deliverResult(batch.tabId, item, r.trim());
+          }
+        }
+      }
+    }
+  }
+  const stillMissing = batch.items.filter((it) => !delivered.has(it.id));
+  if (stillMissing.length > 0) {
+    if (streamError !== null && delivered.size === 0) {
+      // 完全无交付的流中断：视为网络级失败，走瞬时重试
+      handleTransientFailure(batch, streamError);
+    } else {
+      // 部分交付成功 / 流正常结束但解析失败：未交付条目按失败处理（已交付保持）
+      const detail = streamError === null ? extractSseContent(sseText).slice(0, 200) : undefined;
+      for (const item of stillMissing) {
+        stats.failures++;
+        if (item.requestId) deliverResult(batch.tabId, item, item.original);
+        else
+          void notifyTab(batch.tabId, {
+            type: 'KW_REWRITE_ERROR',
+            id: item.id,
+            reason: streamError ?? 'parse',
+            detail,
+            seq: item.seq,
+            path: item.path,
+          });
+      }
+      recordOutcome(delivered.size > 0 ? 1 : 0);
+    }
+  } else if (streamError === null) {
     recordOutcome(1);
-  })();
+  }
+  clearTimeout(timer);
+  inFlight.delete(batch);
+  aborts.delete(batch);
+  persistMirror();
+  void schedule();
 }
 
 function handleTransientFailure(batch: Batch, reason: RewriteReason, detail?: string): void {
@@ -563,6 +639,17 @@ async function handleConfigChanged(): Promise<void> {
 
 // ===== 测试连接（安全：必须走 SW）=====
 
+/**
+ * DeepSeek V3.2+ 的 deepseek-chat 默认启用思考模式（响应前先推理，显著拖慢）。
+ * 官方域名 + 非 reasoner 模型时显式禁用；其他提供商不附加该参数（未知字段可能 400）。
+ */
+function thinkingDisabledParam(config: KindlyConfig): { thinking?: { type: 'disabled' } } {
+  if (config.baseURL.includes('api.deepseek.com') && !config.modelName.toLowerCase().includes('reasoner')) {
+    return { thinking: { type: 'disabled' } };
+  }
+  return {};
+}
+
 async function handleTestConnection(sendResponse: (r: unknown) => void): Promise<void> {
   const config = await getConfig();
   const apiKeys = await getApiKeys();
@@ -582,6 +669,7 @@ async function handleTestConnection(sendResponse: (r: unknown) => void): Promise
         model: config.modelName,
         messages: [{ role: 'user', content: 'ping' }],
         max_tokens: 16,
+        ...thinkingDisabledParam(config),
       }),
       signal: controller.signal,
     });

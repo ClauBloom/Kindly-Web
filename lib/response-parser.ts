@@ -133,3 +133,36 @@ function looksLikeText(text: string): boolean {
   if (/^[[{]/.test(text)) return false;
   return /[\p{L}\p{N}]/u.test(text);
 }
+
+/**
+ * 流式增量解析器：LLM 流式输出按序生成 `"id":"text"` 键值对（JSON 对象形态），
+ * 每出现完整一对（引号闭合、转义正确）立即返回，供调用方边收边交付改写结果。
+ * 维护消费位置，跨 chunk 正确续扫；容忍对象/数组尚未闭合（部分输出）。
+ * value 中的转义（\" \\ \n 等）经 JSON.parse 还原。
+ */
+export function createIncrementalJsonParser(): { push(chunk: string): [string, string][] } {
+  let buf = '';
+  let scanFrom = 0;
+  const pairRe = /"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+  return {
+    push(chunk: string): [string, string][] {
+      buf += chunk;
+      const out: [string, string][] = [];
+      pairRe.lastIndex = scanFrom;
+      let m: RegExpExecArray | null;
+      while ((m = pairRe.exec(buf)) !== null) {
+        const key = m[1] ?? '';
+        const rawValue = m[2] ?? '';
+        let value = rawValue;
+        try {
+          value = JSON.parse(`"${rawValue}"`) as string;
+        } catch {
+          // 非法转义：保留原始捕获
+        }
+        out.push([key, value]);
+        scanFrom = pairRe.lastIndex;
+      }
+      return out;
+    },
+  };
+}
