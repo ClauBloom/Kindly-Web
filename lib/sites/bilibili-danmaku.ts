@@ -217,6 +217,18 @@ const pendingTexts = new Map<string, number>();
 const failTexts = new Map<string, string>();
 /** 规范化原文 → 跳过原因（弹幕总量超过处理上限时整批跳过，屏上打"跳过"角标） */
 const skipTexts = new Map<string, string>();
+/** 内存上限：弹幕密集视频条目可达数十万，超限清空防持续膨胀（屏上状态随之自然清理） */
+const DM_STATE_MAX = 20_000;
+const ID_TO_TEXT_MAX = 50_000;
+
+function capMap(map: Map<string, unknown>, max: number): void {
+  if (map.size >= max) map.clear();
+}
+
+function setState<T>(map: Map<string, T>, key: string, value: T): void {
+  capMap(map, DM_STATE_MAX);
+  map.set(key, value);
+}
 
 /** 改写前隐藏原文（弹幕）：屏上显示"重写中"占位，改写完成后替换（经桥从 SW 同步） */
 let hideOriginalDanmaku = false;
@@ -229,7 +241,7 @@ const DM_MIDLINE_CHECK_MS = 250;
 function onDmConfigChanged(hide: boolean): void {
   hideOriginalDanmaku = hide;
   if (!hide) stopDmMidlineReveal();
-  applyDmTextReplacements();
+  scheduleDmScan();
 }
 
 /**
@@ -299,44 +311,40 @@ function badgeStyle(bg: string): string {
 }
 
 function syncDmBadge(el: HTMLElement, original: string): void {
-  el.querySelector('.kw-dm-badge')?.remove();
+  // 幂等：所需角标与现有一致（文本相同）时跳过，避免每帧 remove+append 强制布局
+  const existing = el.querySelector('.kw-dm-badge');
   const now = Date.now();
+  let want: { text: string; bg: string; title?: string } | null = null;
   if (rewriteResults.has(original)) {
-    const span = document.createElement('span');
-    span.className = 'kw-dm-badge';
-    span.style.cssText = badgeStyle('#4c7a5c');
-    span.textContent = '✓';
-    el.appendChild(span);
+    want = { text: '✓', bg: '#4c7a5c' };
+  } else {
+    const failReason = failTexts.get(original);
+    if (failReason !== undefined) {
+      want = { text: '!', bg: '#ff6b6b', title: failReason };
+    } else {
+      const skipReason = skipTexts.get(original);
+      if (skipReason !== undefined) {
+        want = { text: '跳', bg: '#9aa5a0', title: `跳过改写：${skipReason}` };
+      } else {
+        const sentAt = pendingTexts.get(original);
+        if (sentAt !== undefined && now - sentAt < PENDING_BADGE_TTL_MS) {
+          want = { text: '改', bg: '#9aa5a0' };
+        }
+      }
+    }
+  }
+  if (want === null) {
+    existing?.remove();
     return;
   }
-  const failReason = failTexts.get(original);
-  if (failReason !== undefined) {
-    const span = document.createElement('span');
-    span.className = 'kw-dm-badge';
-    span.style.cssText = badgeStyle('#ff6b6b');
-    span.textContent = '!';
-    span.title = failReason;
-    el.appendChild(span);
-    return;
-  }
-  const skipReason = skipTexts.get(original);
-  if (skipReason !== undefined) {
-    const span = document.createElement('span');
-    span.className = 'kw-dm-badge';
-    span.style.cssText = badgeStyle('#9aa5a0');
-    span.textContent = '跳';
-    span.title = `跳过改写：${skipReason}`;
-    el.appendChild(span);
-    return;
-  }
-  const sentAt = pendingTexts.get(original);
-  if (sentAt !== undefined && now - sentAt < PENDING_BADGE_TTL_MS) {
-    const span = document.createElement('span');
-    span.className = 'kw-dm-badge';
-    span.style.cssText = badgeStyle('#9aa5a0');
-    span.textContent = '改';
-    el.appendChild(span);
-  }
+  if (existing && existing.textContent === want.text) return;
+  existing?.remove();
+  const span = document.createElement('span');
+  span.className = 'kw-dm-badge';
+  span.style.cssText = badgeStyle(want.bg);
+  span.textContent = want.text;
+  if (want.title) span.title = want.title;
+  el.appendChild(span);
 }
 
 /** 观察弹幕渲染容器：新弹幕元素出现时按文本替换 */
@@ -348,9 +356,9 @@ function startDmDomObserver(maxAttempts = 15, intervalMs = 2000): void {
     const el = document.querySelector<HTMLElement>('.bpx-player-render-dm-wrap');
     if (el) {
       dmContainer = el;
-      dmObserver = new MutationObserver(() => applyDmTextReplacements());
+      dmObserver = new MutationObserver(() => scheduleDmScan());
       dmObserver.observe(el, { childList: true, subtree: true });
-      applyDmTextReplacements();
+      scheduleDmScan();
       return;
     }
     if (++attempts > maxAttempts) return;
@@ -384,19 +392,55 @@ function setDmText(el: HTMLElement, text: string): void {
   el.replaceChildren(frag);
 }
 
+/**
+ * 弹幕扫描合并（rAF）：B 站弹幕池每帧增删大量元素，observer 每帧触发多次；
+ * 直接全量遍历会占满主线程（页面未响应）。统一走 rAF 合并，一帧最多一次全量扫描。
+ */
+let dmScanRaf: number | null = null;
+
+function scheduleDmScan(): void {
+  if (dmScanRaf !== null) return;
+  dmScanRaf = requestAnimationFrame(() => {
+    dmScanRaf = null;
+    applyDmTextReplacements();
+  });
+}
+
+/** 规范化缓存：弹幕文本重复率高（刷屏），缓存去重降低每帧正则开销 */
+const NORM_CACHE_MAX = 5000;
+const normCache = new Map<string, string>();
+
+function normKey(text: string): string {
+  const hit = normCache.get(text);
+  if (hit !== undefined) return hit;
+  const normalized = normalizeCommentText(text);
+  if (normCache.size >= NORM_CACHE_MAX) normCache.clear();
+  normCache.set(text, normalized);
+  return normalized;
+}
+
 /** 按原文匹配现存/新增弹幕 DOM 元素并替换为改写文本 */
 function applyDmTextReplacements(): void {
   if (!dmContainer) return;
+  // 空闲快速返回：无任何处理状态时零遍历（弹幕多但未在处理时不产生开销）
+  if (
+    rewriteResults.size === 0 &&
+    pendingTexts.size === 0 &&
+    failTexts.size === 0 &&
+    skipTexts.size === 0
+  ) {
+    return;
+  }
   const now = Date.now();
   const els = dmContainer.querySelectorAll<HTMLElement>('.bili-danmaku-x-dm');
   for (const el of els) {
     // 占位元素用 dataset 记录原文；普通元素用当前文本（均规范化后作为 Map key）
     const raw = el.dataset.kwDmOrig ?? el.textContent?.trim() ?? '';
     if (raw === '') continue;
-    const key = normalizeCommentText(raw);
+    const key = normKey(raw);
     const rewritten = rewriteResults.get(key);
     // 已替换（含表情重建后文本无标记）→ 规范化比较防重复重建
-    if (rewritten !== undefined && normalizeCommentText(el.textContent ?? '') !== normalizeCommentText(rewritten)) {
+    if (rewritten !== undefined && normKey(el.textContent ?? '') !== normKey(rewritten)) {
       setDmText(el, rewritten);
       delete el.dataset.kwDmOrig;
     }
@@ -507,13 +551,13 @@ function applyLiveRewrites(replacements: ReadonlyMap<string, string>): boolean {
     const original = idToText.get(id);
     if (original !== undefined && original !== rewritten) {
       const key = normalizeCommentText(original);
-      rewriteResults.set(key, rewritten);
+      setState(rewriteResults, key, rewritten);
       pendingTexts.delete(key);
       failTexts.delete(key);
       changed = true;
     }
   }
-  if (changed) applyDmTextReplacements();
+  if (changed) scheduleDmScan();
   return changed;
 }
 
@@ -524,9 +568,9 @@ function applyLiveRewrites(replacements: ReadonlyMap<string, string>): boolean {
 function markDmPending(items: { id: string; text: string }[]): void {
   const now = Date.now();
   for (const item of items) {
-    pendingTexts.set(normalizeCommentText(item.text), now);
+    setState(pendingTexts, normalizeCommentText(item.text), now);
   }
-  applyDmTextReplacements();
+  scheduleDmScan();
 }
 
 /** 批中部分/全部改写失败：保持原文，屏上打"失败"角标 */
@@ -536,11 +580,11 @@ function markDmFailed(ids: string[], reason?: string): void {
     const original = idToText.get(id);
     if (original === undefined) continue;
     const key = normalizeCommentText(original);
-    failTexts.set(key, reason ?? '改写失败，已保持原文');
+    setState(failTexts, key, reason ?? '改写失败，已保持原文');
     pendingTexts.delete(key);
     changed = true;
   }
-  if (changed) applyDmTextReplacements();
+  if (changed) scheduleDmScan();
 }
 
 /** 弹幕被跳过改写（弹幕总量超过处理上限）：保持原文，屏上打"跳过"角标 */
@@ -550,11 +594,11 @@ function markDmSkipped(ids: string[], reason: string): void {
     const original = idToText.get(id);
     if (original === undefined) continue;
     const key = normalizeCommentText(original);
-    skipTexts.set(key, reason);
+    setState(skipTexts, key, reason);
     pendingTexts.delete(key);
     changed = true;
   }
-  if (changed) applyDmTextReplacements();
+  if (changed) scheduleDmScan();
 }
 
 // ===== adapter 装配 =====
@@ -569,11 +613,11 @@ export const bilibiliDanmakuAdapter: SiteDanmakuAdapter = {
   parseResponse(data) {
     if (isXmlResponse(data)) {
       const parsed = parseXmlDanmaku(new TextDecoder().decode(data));
-      for (const d of parsed) idToText.set(d.id, d.text);
+      for (const d of parsed) { capMap(idToText, ID_TO_TEXT_MAX); idToText.set(d.id, d.text); }
       return parsed;
     }
     const elems = extractSegElems(data);
-    for (const e of elems) idToText.set(e.idStr, e.content);
+    for (const e of elems) { capMap(idToText, ID_TO_TEXT_MAX); idToText.set(e.idStr, e.content); }
     return elems.map((e) => ({ id: e.idStr, text: e.content }));
   },
   rebuildResponse(buf, replacements) {

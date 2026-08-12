@@ -32,6 +32,19 @@ let dmProbeStarted = false;
 const rewriteCache = new Map<string, string>();
 /** 已发送改写的 id（同段去重） */
 const pendingIds = new Set<string>();
+/** 内存上限：弹幕密集视频 id 可达数十万，超限清空防持续膨胀（重载段退化为重新改写） */
+const REWRITE_CACHE_MAX = 20_000;
+const PENDING_IDS_MAX = 100_000;
+
+function cacheRewrite(id: string, rewritten: string): void {
+  if (rewriteCache.size >= REWRITE_CACHE_MAX) rewriteCache.clear();
+  rewriteCache.set(id, rewritten);
+}
+
+function markPendingId(id: string): void {
+  if (pendingIds.size >= PENDING_IDS_MAX) pendingIds.clear();
+  pendingIds.add(id);
+}
 
 // ===== 弹幕全量批管道（段内不跳过：全部分批 + 并发处理） =====
 /** 段内排队中的弹幕批 */
@@ -290,7 +303,7 @@ function hijackXhr(adapter: SiteAdapter): void {
 // ===== 弹幕异步改写管道 =====
 
 async function rewriteDanmakuWithText(entries: { id: string; text: string }[]): Promise<void> {
-  for (const e of entries) pendingIds.add(e.id);
+  for (const e of entries) markPendingId(e.id);
   // 屏上标记"处理中"（adapter 层按原文打灰"改"角标）
   adapterDanmaku?.onBatchSent?.(entries);
   const items: CommentItem[] = entries.map((e) => ({
@@ -328,7 +341,7 @@ async function rewriteDanmakuWithText(entries: { id: string; text: string }[]): 
   for (const r of res.results) {
     if (r.rewritten !== '') {
       replacements.set(r.id, r.rewritten);
-      rewriteCache.set(r.id, r.rewritten);
+      cacheRewrite(r.id, r.rewritten);
     } else {
       failedIds.push(r.id);
     }
