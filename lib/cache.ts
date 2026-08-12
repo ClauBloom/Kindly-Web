@@ -63,6 +63,8 @@ export function cacheSigOf(
   includeAuthor: boolean,
   kind: 'comment' | 'danmaku' = 'comment',
   style: string = '',
+  enableThinking: boolean = false,
+  emojiToKaomoji: boolean = false,
 ): string {
-  return `${baseURL}|${modelName}|${intensity}|${includeAuthor ? 1 : 0}|${kind}${style ? `|p2|${style}` : ''}`;
+  return `${baseURL}|${modelName}|${intensity}|${includeAuthor ? 1 : 0}|${kind}${style ? `|p2|${style}` : ''}${enableThinking ? '|t' : ''}${emojiToKaomoji ? '|e' : ''}`;
 }

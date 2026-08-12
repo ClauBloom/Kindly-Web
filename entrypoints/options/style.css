@@ -160,12 +160,16 @@ select:focus-visible,
 }
 
 .form-field.inline label {
-  flex: none;
+  flex: 1;
+  min-width: 0;
   font-size: 13px;
   color: var(--muted);
+  line-height: 1.45;
 }
 
-.form-field.inline input {
+.form-field.inline input,
+.form-field.inline select {
+  flex: none;
   width: 110px;
 }
 
@@ -302,6 +306,24 @@ select {
   margin-top: 3px;
   accent-color: var(--primary);
   flex: none;
+}
+
+/* 警告行（思考模式开关等不推荐选项） */
+.check-row.warn {
+  background: #f9ece8;
+  border: 1px solid #ecc9c0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: var(--danger);
+}
+
+.check-row.warn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.check-row.warn input {
+  accent-color: var(--danger);
 }
 
 .site-row {

@@ -260,6 +260,7 @@ export function resolveBilibiliAuthorNode(root: HTMLElement): HTMLElement | null
 export const bilibiliAdapter: SiteAdapter = {
   key: 'bilibili',
   label: 'Bilibili 评论区',
+  danmakuLabel: 'Bilibili 弹幕',
   matches: BILIBILI_MATCHES,
   matchReplyUrl: (url) => REPLY_RE.test(url),
   extractReplies: extractBilibiliReplies,

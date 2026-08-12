@@ -202,6 +202,8 @@ async function enqueueItems(items: CommentItem[], tabId: number): Promise<void> 
       config.includeAuthor,
       kind,
       resolveStyleInstruction(config),
+      config.enableThinking,
+      config.emojiToKaomoji,
     );
     const cached = await cacheGet(item.original, sig);
     if (cached !== null) {
@@ -356,23 +358,27 @@ async function fire(batch: Batch): Promise<void> {
     config.includeAuthor,
     kind,
     resolveStyleInstruction(config),
+    config.enableThinking,
+    config.emojiToKaomoji,
   );
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  const url = `${config.baseURL.replace(/\/+$/, '')}/chat/completions`;
+  const chatBody: Record<string, unknown> = {
+    model: config.modelName,
+    messages: buildMessages(config, batch.items, kind),
+    temperature: 0.6,
+    max_tokens: kind === 'danmaku' ? 1024 : 2048,
+    stream: true,
+    ...thinkingDisabledParam(config),
+  };
+  const requestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+    signal: controller.signal,
+  };
   let res: Response;
   try {
-    res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: config.modelName,
-        messages: buildMessages(config, batch.items, kind),
-        temperature: 0.6,
-        max_tokens: kind === 'danmaku' ? 1024 : 2048,
-        stream: true,
-        ...thinkingDisabledParam(config),
-      }),
-      signal: controller.signal,
-    });
+    res = await fetch(url, { ...requestInit, body: JSON.stringify(chatBody) });
   } catch (err) {
     // 请求本身失败（未建立连接/网络错误）：无任何交付，按瞬时失败重试
     handleTransientFailure(batch, classifyFetchError(err));
@@ -382,6 +388,24 @@ async function fire(batch: Batch): Promise<void> {
     persistMirror();
     void schedule();
     return;
+  }
+
+  // ===== 思考禁用参数降级 =====
+  // 端点不认识 thinking 字段（参数类 400/422）→ 不带该参数重试一次并记住，
+  // 之后该端点不再附加（负缓存，每 SW 会话一次失败请求，不影响改写）
+  if (!res.ok && (res.status === 400 || res.status === 422) && 'thinking' in chatBody) {
+    thinkingUnsupportedFor = config.baseURL;
+    try {
+      res = await fetch(url, { ...requestInit, body: JSON.stringify({ ...chatBody, thinking: undefined }) });
+    } catch (err) {
+      handleTransientFailure(batch, classifyFetchError(err));
+      clearTimeout(timer);
+      inFlight.delete(batch);
+      aborts.delete(batch);
+      persistMirror();
+      void schedule();
+      return;
+    }
   }
 
   if (res.status === 401 || res.status === 403) {
@@ -640,15 +664,25 @@ async function handleConfigChanged(): Promise<void> {
 // ===== 测试连接（安全：必须走 SW）=====
 
 /**
- * DeepSeek V3.2+ 的 deepseek-chat 默认启用思考模式（响应前先推理，显著拖慢）。
- * 官方域名 + 非 reasoner 模型时显式禁用；其他提供商不附加该参数（未知字段可能 400）。
+ * 思考模式禁用参数（对所有 OpenAI 兼容接口生效，不限于某家服务商）：
+ * 开关关闭时显式附加 thinking:{type:'disabled'}，避免模型推理拖慢改写。
+ * - reasoner 等推理专用模型排除：思考是模型固有行为，禁用参数不受支持
+ * - 端点已确认不支持该参数（400/422 降级重试成功）时不再附加（thinkingUnsupportedFor）
+ * 开启思考模式时不附加任何参数（由服务商/模型默认决定）。
  */
 function thinkingDisabledParam(config: KindlyConfig): { thinking?: { type: 'disabled' } } {
-  if (config.baseURL.includes('api.deepseek.com') && !config.modelName.toLowerCase().includes('reasoner')) {
+  if (
+    !config.enableThinking &&
+    !config.modelName.toLowerCase().includes('reasoner') &&
+    thinkingUnsupportedFor !== config.baseURL
+  ) {
     return { thinking: { type: 'disabled' } };
   }
   return {};
 }
+
+/** 已确认不支持 thinking 参数的端点 baseURL（降级重试成功后置位，SW 会话内有效） */
+let thinkingUnsupportedFor = '';
 
 async function handleTestConnection(sendResponse: (r: unknown) => void): Promise<void> {
   const config = await getConfig();
@@ -662,17 +696,24 @@ async function handleTestConnection(sendResponse: (r: unknown) => void): Promise
   const timer = setTimeout(() => controller.abort(), 15_000);
   const t0 = performance.now();
   try {
-    const res = await fetch(`${config.baseURL.replace(/\/+$/, '')}/chat/completions`, {
+    const url = `${config.baseURL.replace(/\/+$/, '')}/chat/completions`;
+    const chatBody: Record<string, unknown> = {
+      model: config.modelName,
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 16,
+      ...thinkingDisabledParam(config),
+    };
+    const requestInit = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: config.modelName,
-        messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 16,
-        ...thinkingDisabledParam(config),
-      }),
       signal: controller.signal,
-    });
+    };
+    let res = await fetch(url, { ...requestInit, body: JSON.stringify(chatBody) });
+    // 思考禁用参数降级（同 fire）：端点不支持 thinking 字段 → 不带参数重试一次
+    if (!res.ok && (res.status === 400 || res.status === 422) && 'thinking' in chatBody) {
+      thinkingUnsupportedFor = config.baseURL;
+      res = await fetch(url, { ...requestInit, body: JSON.stringify({ ...chatBody, thinking: undefined }) });
+    }
     if (res.status === 401 || res.status === 403) {
       authFailed = true;
       broadcastStatus();

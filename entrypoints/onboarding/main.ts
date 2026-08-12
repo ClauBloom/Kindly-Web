@@ -5,7 +5,17 @@
  */
 
 import { browser } from 'wxt/browser';
-import { getApiKey, getConfig, hasOriginAccess, PROVIDER_PRESETS, requestOriginAccess, saveConfig, setApiKey } from '@/lib/config';
+import {
+  DANMAKU_MAX_OPTIONS,
+  getApiKey,
+  getConfig,
+  hasOriginAccess,
+  PROVIDER_PRESETS,
+  requestOriginAccess,
+  saveConfig,
+  setApiKey,
+  STYLE_PRESETS,
+} from '@/lib/config';
 import { allAdapters } from '@/lib/sites/registry';
 import type { Intensity, KindlyConfig, ProviderPreset, UIMode } from '@/lib/config';
 import { t } from '@/lib/i18n';
@@ -60,9 +70,19 @@ async function main(): Promise<void> {
   $('step3-back').textContent = t('btn.back');
   $('step3-next').textContent = t('onb.step3.skipTest');
   document.querySelector('[data-step="4"] .step-title')!.textContent = t('onb.step4.title');
+  document.querySelector('[data-step="4"] .step-desc')!.textContent = t('onb.step4.desc');
   $('intensity-label').textContent = t('onb.step4.intensity');
   $('mode-label').textContent = t('onb.step4.mode');
   $('sites-label').textContent = t('onb.step4.sites');
+  $('stylePreset-label').textContent = t('opt.rewrite.stylePreset');
+  $('danmakuMaxTotal-label').textContent = t('opt.rewrite.danmakuMaxTotal');
+  (document.querySelector('label[for="batchSize"]') as HTMLElement).textContent = t('opt.rewrite.batchSize');
+  (document.querySelector('label[for="timeoutMs"]') as HTMLElement).textContent = t('opt.rewrite.timeout');
+  (document.querySelector('label[for="retryCount"]') as HTMLElement).textContent = t('opt.rewrite.retryCount');
+  (document.querySelector('label[for="retryIntervalSec"]') as HTMLElement).textContent = t('opt.rewrite.retryIntervalSec');
+  $('includeAuthor-label').textContent = t('opt.rewrite.includeAuthor');
+  $('hideOriginalComment-label').textContent = t('opt.rewrite.hideOriginalComment');
+  $('hideOriginalDanmaku-label').textContent = t('opt.rewrite.hideOriginalDanmaku');
   $('step4-back').textContent = t('btn.back');
   $('step4-next').textContent = t('btn.next');
   document.querySelector('[data-step="5"] .step-title')!.textContent = t('onb.step5.title');
@@ -73,6 +93,15 @@ async function main(): Promise<void> {
   buildProviderGrid();
   buildChoiceCards();
   buildSiteList();
+  buildStyleSelect();
+  buildDanmakuMaxTotalSelect();
+  ($('batchSize') as HTMLInputElement).value = String(config.batchSize);
+  ($('timeoutMs') as HTMLInputElement).value = String(Math.round(config.timeoutMs / 1000));
+  ($('retryCount') as HTMLInputElement).value = String(config.retryCount);
+  ($('retryIntervalSec') as HTMLInputElement).value = String(config.retryIntervalSec);
+  ($('includeAuthor') as HTMLInputElement).checked = config.includeAuthor;
+  ($('hideOriginalComment') as HTMLInputElement).checked = config.hideOriginalComment;
+  ($('hideOriginalDanmaku') as HTMLInputElement).checked = config.hideOriginalDanmaku;
 
   // 已配置过（重看引导）：预填
   const apiKey = await getApiKey();
@@ -97,8 +126,9 @@ function bindEvents(): void {
   $('btn-test').addEventListener('click', () => void runTest());
 
   $('step4-back').addEventListener('click', () => go(3));
-  $('step4-next').addEventListener('click', () => go(5));
-  $('step4-next').addEventListener('click', () => savePrefs());
+  $('step4-next').addEventListener('click', () => {
+    if (onStep4Next()) go(5);
+  });
 
   $('step5-cta').addEventListener('click', () => {
     void browser.tabs.create({ url: EXAMPLE_URL });
@@ -146,22 +176,67 @@ function selectProvider(card: HTMLElement, preset: ProviderPreset): void {
   hideKeyError();
 }
 
-/** 站点列表：由 lib/sites/registry.ts 驱动，新增平台自动出现 */
+/** 站点列表：评论/弹幕分开开关（由 lib/sites/registry.ts 驱动，新增平台自动出现） */
 function buildSiteList(): void {
   const container = $('site-list');
   container.innerHTML = '';
   for (const site of allAdapters()) {
-    const label = document.createElement('label');
-    label.className = 'site-row';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.dataset.siteKey = site.key;
-    checkbox.checked = config.enabledSites.includes(site.key);
-    const span = document.createElement('span');
-    span.textContent = site.label;
-    label.append(checkbox, span);
-    container.appendChild(label);
+    container.appendChild(
+      buildSiteRow(site.label, site.key, 'comment', config.enabledSites.includes(site.key)),
+    );
+    if (site.danmaku) {
+      container.appendChild(
+        buildSiteRow(site.danmakuLabel ?? `${site.label} 弹幕`, site.key, 'danmaku', config.danmakuEnabledSites.includes(site.key)),
+      );
+    }
   }
+}
+
+function buildSiteRow(label: string, siteKey: string, cap: 'comment' | 'danmaku', checked: boolean): HTMLElement {
+  const row = document.createElement('label');
+  row.className = 'site-row';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.dataset.siteKey = siteKey;
+  checkbox.dataset.cap = cap;
+  checkbox.checked = checked;
+  const span = document.createElement('span');
+  span.textContent = label;
+  row.append(checkbox, span);
+  return row;
+}
+
+/** 输出风格下拉：内置预置 + 已有自定义风格（只读展示，避免选中项被重置） */
+function buildStyleSelect(): void {
+  const select = $('stylePreset') as HTMLSelectElement;
+  for (const preset of STYLE_PRESETS) {
+    const opt = document.createElement('option');
+    opt.value = preset.id;
+    opt.textContent = preset.label;
+    select.appendChild(opt);
+  }
+  for (const custom of config.customStyles) {
+    const opt = document.createElement('option');
+    opt.value = custom.id;
+    opt.textContent = `自定义 · ${custom.name}`;
+    select.appendChild(opt);
+  }
+  const known = STYLE_PRESETS.some((p) => p.id === config.styleId) ||
+    config.customStyles.some((c) => c.id === config.styleId);
+  if (!known) config.styleId = 'default';
+  select.value = config.styleId;
+}
+
+/** 弹幕处理上限下拉——选项定义共享自 lib/config.ts（与 options 一致） */
+function buildDanmakuMaxTotalSelect(): void {
+  const select = $('danmakuMaxTotal') as HTMLSelectElement;
+  for (const opt of DANMAKU_MAX_OPTIONS) {
+    const el = document.createElement('option');
+    el.value = opt.value === null ? '' : String(opt.value);
+    el.textContent = opt.label;
+    select.appendChild(el);
+  }
+  select.value = config.danmakuMaxTotal === null ? '' : String(config.danmakuMaxTotal);
 }
 
 function buildChoiceCards(): void {  buildRadioCards('intensity-cards', INTENSITY_OPTIONS, config.intensity, (v) => {
@@ -275,14 +350,56 @@ async function runTest(): Promise<void> {
   }
 }
 
-function savePrefs(): void {
-  const checked = Array.from(document.querySelectorAll<HTMLInputElement>('#site-list input[type="checkbox"]:checked'));
+/** 第 4 步保存：校验 + 写回所有基本配置；校验失败留在本步并提示 */
+function onStep4Next(): boolean {
+  const batchSize = Number(($('batchSize') as HTMLInputElement).value);
+  const timeoutSec = Number(($('timeoutMs') as HTMLInputElement).value);
+  const retryCount = Number(($('retryCount') as HTMLInputElement).value);
+  const retryIntervalSec = Number(($('retryIntervalSec') as HTMLInputElement).value);
+  if (!Number.isFinite(batchSize) || batchSize < 1 || batchSize > 20) return showStep4Error('每批评论数需在 1–20 之间');
+  if (!Number.isFinite(timeoutSec) || timeoutSec < 5 || timeoutSec > 120) return showStep4Error('请求超时需在 5–120 秒之间');
+  if (!Number.isInteger(retryCount) || retryCount < 0 || retryCount > 5) return showStep4Error('重试次数需为 0–5 的整数');
+  if (!Number.isInteger(retryIntervalSec) || retryIntervalSec < 0 || retryIntervalSec > 30) return showStep4Error('重试间隔需为 0–30 的整数（秒）');
+  hideStep4Error();
+  const checkedInputs = Array.from(document.querySelectorAll<HTMLInputElement>('#site-list input[type="checkbox"]:checked'));
+  const enabledSites = checkedInputs.filter((c) => c.dataset.cap !== 'danmaku')
+    .map((c) => c.dataset.siteKey ?? '')
+    .filter(Boolean);
+  const danmakuEnabledSites = checkedInputs.filter((c) => c.dataset.cap === 'danmaku')
+    .map((c) => c.dataset.siteKey ?? '')
+    .filter(Boolean);
+  const danmakuMaxRaw = ($('danmakuMaxTotal') as HTMLSelectElement).value;
+  const danmakuMaxTotal = danmakuMaxRaw === '' ? null : Number(danmakuMaxRaw);
   // 第 4 步是向导最后一步表单：走到第 5 步（完成页）即视为引导完成。
   // 不写的话 onboardingDone 永远为 false，popup 会一直显示"开始配置"（死循环）
   void saveConfig({
-    enabledSites: checked.map((c) => c.dataset.siteKey ?? '').filter(Boolean),
+    enabledSites,
+    danmakuEnabledSites,
     onboardingDone: true,
+    batchSize,
+    timeoutMs: timeoutSec * 1000,
+    retryCount,
+    retryIntervalSec,
+    danmakuMaxTotal,
+    styleId: ($('stylePreset') as HTMLSelectElement).value,
+    includeAuthor: ($('includeAuthor') as HTMLInputElement).checked,
+    hideOriginalComment: ($('hideOriginalComment') as HTMLInputElement).checked,
+    hideOriginalDanmaku: ($('hideOriginalDanmaku') as HTMLInputElement).checked,
+  }).then(() => {
+    void browser.runtime.sendMessage({ type: 'KW_CONFIG_CHANGED' }).catch(() => {});
   });
+  return true;
+}
+
+function showStep4Error(text: string): boolean {
+  const el = $('step4-error');
+  el.textContent = text;
+  el.classList.remove('hidden');
+  return false;
+}
+
+function hideStep4Error(): void {
+  $('step4-error').classList.add('hidden');
 }
 
 function go(target: number): void {

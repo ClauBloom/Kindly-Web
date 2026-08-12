@@ -2,7 +2,7 @@
   "name": "kindly-web",
   "description": "将网络评论中的攻击性表达重写为友善表达。评论原文仅发送至你自行配置的 LLM API。",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "scripts": {
     "postinstall": "wxt prepare",

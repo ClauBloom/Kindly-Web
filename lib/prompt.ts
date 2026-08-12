@@ -44,7 +44,7 @@ export function resolveStyleInstruction(
 }
 
 export function buildMessages(
-  config: Pick<KindlyConfig, 'intensity' | 'includeAuthor' | 'styleId' | 'customStyles'>,
+  config: Pick<KindlyConfig, 'intensity' | 'includeAuthor' | 'styleId' | 'customStyles' | 'emojiToKaomoji'>,
   items: MessageItem[],
   kind: 'comment' | 'danmaku' = 'comment',
 ): { role: 'system' | 'user'; content: string }[] {
@@ -71,10 +71,17 @@ export function buildMessages(
 4. 不要添加原文没有的事实、观点或标签。
 5. 改写力度：${rule}`;
   }
-  // 输出风格指令：空串（默认仅改写）时不追加，保持提示词与旧版一致
-  if (style) {
-    system += `\n6. 输出风格：${style}`;
+  // 追加规则：表情符号转颜文字（可选）→ 输出风格（可选），编号动态接续
+  let extra = '';
+  let next = 6;
+  if (config.emojiToKaomoji) {
+    extra += `\n${next}. 表情符号转颜文字：若文本中出现表情符号（emoji，如 😀😂😡👍❤️ 等），将其改写为对应情绪与含义的颜文字（kaomoji，如 (^_^)、(≧▽≦)、>_<、(╥﹏╥) 等），与文本自然融合；原文没有表情符号时不要凭空添加。`;
+    next++;
   }
+  if (style) {
+    extra += `\n${next}. 输出风格：${style}`;
+  }
+  system += extra;
 
   const payload = items.map((it) =>
     config.includeAuthor && it.author ? { id: it.id, author: it.author, text: it.original } : { id: it.id, text: it.original },

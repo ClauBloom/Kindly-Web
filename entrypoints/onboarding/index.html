@@ -113,6 +113,51 @@
             <span class="field-label" id="sites-label"></span>
             <div id="site-list"></div>
           </div>
+          <div class="form-grid">
+            <div class="form-field">
+              <span class="field-label" id="stylePreset-label"></span>
+              <select id="stylePreset"></select>
+            </div>
+            <div class="form-field">
+              <span class="field-label" id="danmakuMaxTotal-label"></span>
+              <select id="danmakuMaxTotal"></select>
+            </div>
+            <div class="form-field inline">
+              <label for="batchSize"></label>
+              <input id="batchSize" type="number" min="1" max="20" />
+            </div>
+            <div class="form-field inline">
+              <label for="timeoutMs"></label>
+              <input id="timeoutMs" type="number" min="5" max="120" />
+            </div>
+            <div class="form-field inline">
+              <label for="retryCount"></label>
+              <input id="retryCount" type="number" min="0" max="5" />
+            </div>
+            <div class="form-field inline">
+              <label for="retryIntervalSec"></label>
+              <input id="retryIntervalSec" type="number" min="0" max="30" />
+            </div>
+            <div class="form-field checkbox-field">
+              <label class="check-row">
+                <input type="checkbox" id="includeAuthor" />
+                <span id="includeAuthor-label"></span>
+              </label>
+            </div>
+            <div class="form-field checkbox-field">
+              <label class="check-row">
+                <input type="checkbox" id="hideOriginalComment" />
+                <span id="hideOriginalComment-label"></span>
+              </label>
+            </div>
+            <div class="form-field checkbox-field">
+              <label class="check-row">
+                <input type="checkbox" id="hideOriginalDanmaku" />
+                <span id="hideOriginalDanmaku-label"></span>
+              </label>
+            </div>
+          </div>
+          <p class="hint error hidden" id="step4-error"></p>
           <div class="step-actions">
             <button id="step4-back" class="btn btn-ghost"></button>
             <button id="step4-next" class="btn btn-primary"></button>

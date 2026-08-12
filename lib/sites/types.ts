@@ -68,6 +68,8 @@ export interface SiteAdapter {
   key: string;
   /** 用户可见名称，如 'Bilibili 评论区' */
   label: string;
+  /** 弹幕能力用户可见名称（站点管理中弹幕开关行；缺省用 `${label} 弹幕`） */
+  danmakuLabel?: string;
   /** 站点域名匹配（manifest content_scripts.matches；entrypoint 内仍需字面量） */
   matches: string[];
   /** 评论 API URL 匹配（main world，劫持层） */

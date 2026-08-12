@@ -62,6 +62,8 @@ async function main(): Promise<void> {
   $('includeAuthor-label').textContent = t('opt.rewrite.includeAuthor');
   $('hideOriginalComment-label').textContent = t('opt.rewrite.hideOriginalComment');
   $('hideOriginalDanmaku-label').textContent = t('opt.rewrite.hideOriginalDanmaku');
+  $('emojiToKaomoji-label').textContent = t('opt.rewrite.emojiToKaomoji');
+  $('enableThinking-label').textContent = `${t('opt.rewrite.thinking')} — ${t('opt.rewrite.thinking.warn')}`;
   $('btn-test').textContent = t('btn.test');
   $('btn-clear-cache').textContent = t('opt.data.clearCache');
   $('btn-review-onboarding').textContent = t('opt.data.reviewOnboarding');
@@ -87,6 +89,8 @@ async function main(): Promise<void> {
   ($('includeAuthor') as HTMLInputElement).checked = config.includeAuthor;
   ($('hideOriginalComment') as HTMLInputElement).checked = config.hideOriginalComment;
   ($('hideOriginalDanmaku') as HTMLInputElement).checked = config.hideOriginalDanmaku;
+  ($('emojiToKaomoji') as HTMLInputElement).checked = config.emojiToKaomoji;
+  ($('enableThinking') as HTMLInputElement).checked = config.enableThinking;
   buildDmSpeedControls(config);
   buildDanmakuMaxTotalSelect(config.danmakuMaxTotal);
   customStyles = [...config.customStyles];
@@ -298,22 +302,34 @@ function updateKeyHint(): void {
   }
 }
 
-/** 站点管理：由 lib/sites/registry.ts 驱动，新增平台自动出现 */
+/** 站点管理：评论/弹幕分开开关（由 lib/sites/registry.ts 驱动，新增平台自动出现） */
 function buildSiteList(): void {
   const container = $('site-list');
   container.innerHTML = '';
   for (const site of allAdapters()) {
-    const label = document.createElement('label');
-    label.className = 'check-row site-row';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.dataset.siteKey = site.key;
-    checkbox.checked = config.enabledSites.includes(site.key);
-    const span = document.createElement('span');
-    span.textContent = site.label;
-    label.append(checkbox, span);
-    container.appendChild(label);
+    container.appendChild(
+      buildSiteRow(site.label, site.key, 'comment', config.enabledSites.includes(site.key)),
+    );
+    if (site.danmaku) {
+      container.appendChild(
+        buildSiteRow(site.danmakuLabel ?? `${site.label} 弹幕`, site.key, 'danmaku', config.danmakuEnabledSites.includes(site.key)),
+      );
+    }
   }
+}
+
+function buildSiteRow(label: string, siteKey: string, cap: 'comment' | 'danmaku', checked: boolean): HTMLElement {
+  const row = document.createElement('label');
+  row.className = 'check-row site-row';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.dataset.siteKey = siteKey;
+  checkbox.dataset.cap = cap;
+  checkbox.checked = checked;
+  const span = document.createElement('span');
+  span.textContent = label;
+  row.append(checkbox, span);
+  return row;
 }
 
 async function save(): Promise<void> {
@@ -341,7 +357,12 @@ async function save(): Promise<void> {
   if (key) savedKey = key;
   const checkedSites = Array.from(
     document.querySelectorAll<HTMLInputElement>('#site-list input[type="checkbox"]:checked'),
-  ).map((c) => c.dataset.siteKey ?? '')
+  );
+  const enabledSites = checkedSites.filter((c) => c.dataset.cap !== 'danmaku')
+    .map((c) => c.dataset.siteKey ?? '')
+    .filter(Boolean);
+  const danmakuEnabledSites = checkedSites.filter((c) => c.dataset.cap === 'danmaku')
+    .map((c) => c.dataset.siteKey ?? '')
     .filter(Boolean);
   const dmConcurrency = Number(($('dmConcurrency') as HTMLInputElement).value);
   const dmBatchSize = Number(($('dmBatchSize') as HTMLInputElement).value);
@@ -363,7 +384,10 @@ async function save(): Promise<void> {
       includeAuthor: ($('includeAuthor') as HTMLInputElement).checked,
       hideOriginalComment: ($('hideOriginalComment') as HTMLInputElement).checked,
       hideOriginalDanmaku: ($('hideOriginalDanmaku') as HTMLInputElement).checked,
-      enabledSites: checkedSites,
+      emojiToKaomoji: ($('emojiToKaomoji') as HTMLInputElement).checked,
+      enableThinking: ($('enableThinking') as HTMLInputElement).checked,
+      enabledSites: enabledSites,
+      danmakuEnabledSites: danmakuEnabledSites,
       danmakuMaxTotal,
       dmPreset: presetMatch ?? 'custom',
       dmConcurrency,

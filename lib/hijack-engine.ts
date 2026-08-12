@@ -23,6 +23,11 @@ const BATCH_TIMEOUT_MS = 45_000;
 let dmBatchSize = 40;
 let dmConcurrency = 16;
 
+/** 弹幕改写站点开关（经桥从配置同步；同步前默认开启，与历史行为一致） */
+let dmEnabled = true;
+/** 弹幕屏上探测是否已启动（仅启用后启动一次，关闭时不启动） */
+let dmProbeStarted = false;
+
 /** 改写结果缓存（id → 友善版），供弹幕段重载时直接替换 */
 const rewriteCache = new Map<string, string>();
 /** 已发送改写的 id（同段去重） */
@@ -57,7 +62,8 @@ function pumpDanmakuBatches(): void {
 
 export function startHijack(adapter: SiteAdapter): void {
   adapterDanmaku = adapter.danmaku ?? null;
-  adapter.danmaku?.startLiveProbe?.();
+  // 弹幕屏上替换探测不在此处启动：danmakuEnabledSites 关闭时不应探测，
+  // 延后到 syncMainConfig 拿到配置后按开关启动（桥就绪通常毫秒级，不影响探测重试）
   // B 站新版页面不再请求 view 接口（实测 2026-08）→ 弹幕阈值数据源失效；
   // 从页面内嵌数据轮询读取弹幕总量（main world，document_start 时页面脚本尚未执行）
   if (adapter.videoMeta?.extractDanmakuTotalFromPage) {
@@ -68,10 +74,10 @@ export function startHijack(adapter: SiteAdapter): void {
   listenFromExtension((msg) => {
     const m = msg as { type?: string };
     // SW 广播配置变更 → 重拉配置（隐藏原文等 MAIN 侧行为）
-    if (m?.type === 'KW_CONFIG_CHANGED') void syncMainConfig();
+    if (m?.type === 'KW_CONFIG_CHANGED') void syncMainConfig(adapter);
   });
   // 拉取初始配置（桥就绪后 sendToExtensionWithResponse 会排队补发）
-  void syncMainConfig();
+  void syncMainConfig(adapter);
   hijackFetch(adapter);
   hijackXhr(adapter);
 }
@@ -84,6 +90,8 @@ const SSR_PROBE_MAX_ATTEMPTS = 50;
 function probeSsrVideoMeta(videoMeta: NonNullable<SiteAdapter['videoMeta']>): void {
   let attempts = 0;
   const tick = () => {
+    // 弹幕关闭后不再上报（阈值只在弹幕管道使用）
+    if (!dmEnabled) return;
     try {
       const total = videoMeta.extractDanmakuTotalFromPage?.() ?? null;
       if (total !== null) {
@@ -105,7 +113,7 @@ export function shouldHideOriginal(kind: 'comment' | 'danmaku'): boolean {
   return kind === 'danmaku' ? (mainConfig?.hideOriginalDanmaku ?? false) : (mainConfig?.hideOriginalComment ?? false);
 }
 
-async function syncMainConfig(): Promise<void> {
+async function syncMainConfig(adapter: SiteAdapter): Promise<void> {
   try {
     const res = await sendToExtensionWithResponse<{ type: 'KW_CONFIG'; config: KindlyConfig }>({ type: 'KW_GET_CONFIG' });
     if (res?.type === 'KW_CONFIG' && res.config) {
@@ -116,6 +124,12 @@ async function syncMainConfig(): Promise<void> {
       // 弹幕批大小/并发也由配置驱动（用户可选速度预设或自定义）
       dmBatchSize = res.config.dmBatchSize;
       dmConcurrency = res.config.dmConcurrency;
+      // 弹幕站点开关（评论/弹幕分开管理）：关闭则不再劫持/送改写/屏上替换
+      dmEnabled = res.config.danmakuEnabledSites.includes(adapter.key);
+      if (dmEnabled && !dmProbeStarted) {
+        dmProbeStarted = true;
+        adapter.danmaku?.startLiveProbe?.();
+      }
       // 配置变化后重新同步屏上弹幕占位状态（隐藏开启时把已加载原文替换为占位）
       adapterDanmaku?.onConfigChanged?.(mainConfig.hideOriginalDanmaku);
     }
@@ -132,7 +146,7 @@ function hijackFetch(adapter: SiteAdapter): void {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : String(input);
     try {
       if (adapter.matchReplyUrl(url)) return await handleReplyFetch(origFetch, input, init, adapter);
-      if (adapter.danmaku?.matchUrl(url)) return await handleDanmakuFetch(origFetch, input, init, adapter);
+      if (adapter.danmaku?.matchUrl(url) && dmEnabled) return await handleDanmakuFetch(origFetch, input, init, adapter);
       if (adapter.videoMeta?.matchUrl(url)) {
         const res = await origFetch(input, init);
         void res
@@ -252,7 +266,7 @@ function hijackXhr(adapter: SiteAdapter): void {
           // 非 JSON 响应，忽略
         }
       });
-    } else if (adapter.danmaku?.matchUrl(url)) {
+    } else if (adapter.danmaku?.matchUrl(url) && dmEnabled) {
       this.addEventListener('load', () => {
         // 只读提取：响应已由页面消费（放行），改写结果走屏上替换路径
         const raw = this.response;

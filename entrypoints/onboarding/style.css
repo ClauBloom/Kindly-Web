@@ -275,6 +275,7 @@ body {
 
 /* 表单 */
 .form-field {
+  min-width: 0;
   margin-bottom: 14px;
 }
 
@@ -299,9 +300,21 @@ input[type='number'] {
   background: #fbfcf9;
 }
 
-input:focus {
+input:focus,
+select:focus {
   outline: none;
   border-color: var(--primary);
+}
+
+select {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1.5px solid var(--line);
+  border-radius: 10px;
+  font-size: 14px;
+  font-family: inherit;
+  background: #fbfcf9;
+  color: var(--ink);
 }
 
 .key-row {
@@ -438,6 +451,58 @@ input:focus {
   accent-color: var(--primary);
 }
 
+/* 更多偏好（结构与 options 一致） */
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px 18px;
+  margin-bottom: 4px;
+}
+
+.form-field.inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.form-field.inline label {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.form-field.inline input {
+  flex: none;
+  width: 110px;
+}
+
+.form-field.checkbox-field {
+  grid-column: 1 / -1;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.check-row input {
+  width: 16px;
+  height: 16px;
+  margin-top: 3px;
+  accent-color: var(--primary);
+  flex: none;
+}
+
+.check-row:hover {
+  color: var(--primary-strong);
+}
+
 /* 完成 */
 .done-mark {
   display: flex;
@@ -456,5 +521,9 @@ input:focus {
 @media (max-width: 520px) {
   .provider-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
   }
 }

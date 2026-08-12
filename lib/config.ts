@@ -42,8 +42,10 @@ export interface KindlyConfig {
   timeoutMs: number;
   /** 是否把评论者昵称发给 LLM（隐私选项） */
   includeAuthor: boolean;
-  /** 启用站点，CS 启动时过滤 */
+  /** 启用站点（评论区），CS 启动时过滤 */
   enabledSites: string[];
+  /** 启用弹幕改写的站点（与 enabledSites 独立：站点管理里评论区/弹幕分开开关） */
+  danmakuEnabledSites: string[];
   /** 初次引导完成标记（未完成 → popup 显示引导 CTA） */
   onboardingDone: boolean;
   /**
@@ -69,6 +71,16 @@ export interface KindlyConfig {
   retryCount: number;
   /** 网络失败重试基础间隔（秒；退避 = 间隔 × 2^(重试次数-1)，0 = 立即重试） */
   retryIntervalSec: number;
+  /**
+   * 启用思考模式（通用开关，对所有 OpenAI 兼容接口生效，不限于某家服务商）：
+   * 默认关闭——请求显式附加 thinking:disabled，避免推理拖慢改写；
+   * 开启后不附加参数，由服务商/模型默认决定。
+   * 端点不支持该参数（参数类 400/422）时自动降级：重试一次不带参数并记住，
+   * 不影响改写；reasoner 等推理专用模型不附加（思考为模型固有行为）。
+   */
+  enableThinking: boolean;
+  /** 自动将表情符号转为颜文字（由 LLM 在改写时处理；开启后追加改写规则） */
+  emojiToKaomoji: boolean;
 }
 
 /** 弹幕处理速度预设（快速 → 慢速）：高并发+小批 到 低并发+大批 */
@@ -123,7 +135,7 @@ export const STYLE_PRESETS: StylePreset[] = [
   },
 ];
 
-export const CURRENT_CONFIG_VERSION = 3;
+export const CURRENT_CONFIG_VERSION = 6;
 
 export const DEFAULT_CONFIG: KindlyConfig = {
   version: CURRENT_CONFIG_VERSION,
@@ -136,8 +148,9 @@ export const DEFAULT_CONFIG: KindlyConfig = {
   timeoutMs: 30_000,
   includeAuthor: false,
   enabledSites: ['bilibili'],
+  danmakuEnabledSites: ['bilibili'],
   onboardingDone: false,
-  danmakuMaxTotal: 10_000,
+  danmakuMaxTotal: 5_000,
   hideOriginalComment: false,
   hideOriginalDanmaku: false,
   dmPreset: 'standard',
@@ -147,16 +160,24 @@ export const DEFAULT_CONFIG: KindlyConfig = {
   customStyles: [],
   retryCount: 2,
   retryIntervalSec: 1,
+  enableThinking: false,
+  emojiToKaomoji: false,
 };
 
 /**
  * 配置迁移链（借鉴 kiss-translator runDataMigration 的思路，结构就位）。
  * v1→v2：新增输出风格字段（内置默认 + 空自定义列表）。
  * v2→v3：新增失败重试设置（次数 + 基础间隔，沿用既有默认行为 2 次 / 1s）。
+ * v3→v4：弹幕站点独立开关（评论/弹幕分开管理；默认跟随原评论开关，行为不变）。
+ * v4→v5：思考模式开关（默认关闭 = 沿用既有禁用思考行为）。
+ * v5→v6：表情符号转颜文字开关（默认关闭，不影响既有改写行为）。
  */
 const MIGRATIONS: Record<number, (cfg: KindlyConfig) => KindlyConfig> = {
   1: (cfg) => ({ ...cfg, styleId: 'default', customStyles: [] }),
   2: (cfg) => ({ ...cfg, retryCount: 2, retryIntervalSec: 1 }),
+  3: (cfg) => ({ ...cfg, danmakuEnabledSites: [...cfg.enabledSites] }),
+  4: (cfg) => ({ ...cfg, enableThinking: false }),
+  5: (cfg) => ({ ...cfg, emojiToKaomoji: false }),
 };
 
 export interface ProviderPreset {
