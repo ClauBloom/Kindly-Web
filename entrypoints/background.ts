@@ -235,8 +235,12 @@ function deliverResult(tabId: number, item: PendingItem | CommentItem, rewritten
   if (item.requestId) {
     const agg = aggregates.get(item.requestId);
     if (agg) {
-      agg.results.set(item.id, rewritten);
-      agg.remaining--;
+      // 幂等：同一 id 重复交付（缓存命中/重试路径）不重复计数，
+      // 否则 remaining 提前归零会丢失未完成条目的结果
+      if (!agg.results.has(item.id)) {
+        agg.results.set(item.id, rewritten);
+        agg.remaining--;
+      }
       if (agg.remaining <= 0) {
         aggregates.delete(item.requestId);
         void browser.tabs.sendMessage(tabId, {
@@ -362,6 +366,30 @@ async function fire(batch: Batch): Promise<void> {
     config.emojiToKaomoji,
   );
   const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  // 重试前缓存过滤：已改写成功的条目直接交付，不再重复请求 LLM
+  // （网络/parse 重试路径的 batch 未经过 enqueueItems 的缓存检查）
+  if (batch.attempts > 0) {
+    const freshItems: PendingItem[] = [];
+    for (const item of batch.items) {
+      const cached = await cacheGet(item.original, sig);
+      if (cached !== null) {
+        stats.totalRewritten++;
+        deliverResult(batch.tabId, item, cached);
+      } else {
+        freshItems.push(item);
+      }
+    }
+    if (freshItems.length === 0) {
+      recordOutcome(1);
+      clearTimeout(timer);
+      inFlight.delete(batch);
+      aborts.delete(batch);
+      persistMirror();
+      void schedule();
+      return;
+    }
+    batch.items = freshItems;
+  }
   const url = `${config.baseURL.replace(/\/+$/, '')}/chat/completions`;
   const chatBody: Record<string, unknown> = {
     model: config.modelName,

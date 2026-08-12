@@ -162,9 +162,15 @@ function parseXmlDanmaku(xml: string): { id: string; text: string }[] {
   const out: { id: string; text: string }[] = [];
   const re = /<d p="([^"]*)">([\s\S]*?)<\/d>/g;
   let m: RegExpExecArray | null;
+  let index = 0;
   while ((m = re.exec(xml)) !== null) {
-    const id = m[1]?.split(',')[0] ?? '';
+    const attrs = m[1] ?? '';
     const text = m[2] ?? '';
+    // list.so 无唯一 id：p 属性首段是弹幕时间（秒），同秒多条会撞 id →
+    // 用「时间戳-行号」构造稳定唯一 id（同响应同序 → 段重载可去重）
+    const stamp = attrs.split(',')[0] ?? '';
+    const id = `${stamp}-${index}`;
+    index++;
     if (id && text.trim()) out.push({ id, text });
   }
   return out;
@@ -435,7 +441,19 @@ function applyDmTextReplacements(): void {
   const els = dmContainer.querySelectorAll<HTMLElement>('.bili-danmaku-x-dm');
   for (const el of els) {
     // 占位元素用 dataset 记录原文；普通元素用当前文本（均规范化后作为 Map key）
-    const raw = el.dataset.kwDmOrig ?? el.textContent?.trim() ?? '';
+    let raw = el.dataset.kwDmOrig ?? '';
+    if (raw !== '') {
+      // 弹幕元素池复用：B 站重置 textContent 但不清 dataset → 残留的旧原文
+      // 会把新弹幕误当成旧弹幕处理（错误占位/替换 → 频闪）。检测：文本既不是
+      // 占位也不是记录的原文（且与原文不等）→ 视为残留，清除后按当前文本处理。
+      const cur = el.textContent?.trim() ?? '';
+      if (cur !== PENDING_PLACEHOLDER && cur !== raw && cur !== '') {
+        delete el.dataset.kwDmOrig;
+        raw = cur;
+      }
+    } else {
+      raw = el.textContent?.trim() ?? '';
+    }
     if (raw === '') continue;
     const key = normKey(raw);
     const rewritten = rewriteResults.get(key);
@@ -551,6 +569,9 @@ function applyLiveRewrites(replacements: ReadonlyMap<string, string>): boolean {
     const original = idToText.get(id);
     if (original !== undefined && original !== rewritten) {
       const key = normalizeCommentText(original);
+      // 首次结果优先：同一弹幕被重复请求（段重载/重试/多实例）时，
+      // 后续结果直接忽略——否则每次结果不同会反复替换 DOM（弹幕频闪）
+      if (rewriteResults.has(key)) continue;
       setState(rewriteResults, key, rewritten);
       pendingTexts.delete(key);
       failTexts.delete(key);

@@ -54,6 +54,9 @@ let dmInflight = 0;
 
 /** 全量弹幕分批入队（按当前配置的批大小切批；pendingIds 已过滤） */
 function queueDanmakuBatches(elems: { id: string; text: string }[]): void {
+  // 入队即标记去重：批在队列积压期间（低并发时窗口更长）播放器可能再次请求
+  // 同一段（seek/重播）——若等到批取出才标记，未取出的批会被重复入队送 LLM
+  for (const e of elems) markPendingId(e.id);
   for (let i = 0; i < elems.length; i += dmBatchSize) {
     dmQueuedBatches.push(elems.slice(i, i + dmBatchSize));
   }
